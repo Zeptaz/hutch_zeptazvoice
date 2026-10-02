@@ -8,6 +8,10 @@ Zeptaz Voice Core → Hutch Adapter → expected Hutch Resolve API
 
 Resolve is not implemented in this repository. See [`docs/hutch-resolve-contract.md`](docs/hutch-resolve-contract.md) for server contracts, authentication, and failure behavior.
 
+## Team plan and qualification
+
+Read [context.md](context.md) before implementation. The existing 15 tests pass, but additional inspection reproduced transcript-finalization and single-turn session failures. Voice remains partially implemented until the runtime and live integration gates in Harry's plan pass.
+
 ## Local start
 
 Python 3.12+ is recommended. Copy `.env.example` to `.env`, supply `GEMINI_API_KEY`, and configure HMAC secrets. Start:

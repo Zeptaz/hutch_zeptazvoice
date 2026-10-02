@@ -2,6 +2,14 @@
 
 This repository implements only the Voice side. Resolve API handlers, browser UI, operations and mock providers are future work in `hutch_resolve`; the client below targets that contract and uses stubs in tests.
 
+## Current qualification and shared plan
+
+The [canonical team plan](https://github.com/Zeptaz/hutch_resolve/blob/main/context.md) and [Resolve API specification](https://github.com/Zeptaz/hutch_resolve/blob/main/docs/contracts.md) define upcoming integration work. Existing Voice models remain the compatibility boundary; new Resolve routes are proposed, not deployed.
+
+On 2026-10-02 all 15 existing Voice tests passed. A separate fake SDK/WebSocket reproduction found that split transcription/tool/turn-complete events lose the finalized caller turn and the session terminates after one model turn. The audio behavior described below is the intended contract and is **not fully qualified**. Harry's H-08 tasks include committed runtime regressions, fixes, interruption/cleanup checks and a live integrated call. See [Voice context](../context.md).
+
+Upcoming additive browser event (not implemented yet): `{"type":"interrupted","response_id":null}`; supply the affected Resolve response ID when known. Voice emits it on provider interruption before further output and clears proposal-presentation eligibility; Jayith's browser stops/discards queued audio and pending presentation acknowledgement. The current strict HTTP request/response models remain unchanged. For `end_session=true`, the planned runtime delivers final grounded output, emits `ended` with reason `resolve_requested`, and closes after turn completion or bounded timeout. Shared OpenAPI documents the planned browser control schemas separately from HTTP endpoints.
+
 ## Session setup
 
 Resolve calls Voice `POST /api/hutch/sessions` over HTTPS with the standard HMAC headers. Body:
