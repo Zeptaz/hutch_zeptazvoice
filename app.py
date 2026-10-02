@@ -155,6 +155,197 @@ def _grant_from_protocol(header: str) -> tuple[str, str] | None:
     return common, grant
 
 
+async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: str,
+                                  session_id: str, max_audio_bytes: int,
+                                  max_session_seconds: int, end_session_timeout_seconds: float = 5.0):
+    """Supervise both sides of the live call until disconnect, failure, or Resolve end."""
+    input_fragments: list[str] = []
+    latest_user_turn = ""
+    pending_tool_calls: list = []
+    language = "en"
+    allow_model_audio = False
+    proposal_audio_complete = False
+    proposal_acknowledged = False
+    proposal_audio_expected = False
+    latest_response_id: str | None = None
+    resolve_end_requested = False
+    end_deadline: float | None = None
+    ended_reason: str | None = None
+    audio_bytes = 0
+
+    async def receive_audio():
+        nonlocal audio_bytes, proposal_audio_complete, proposal_acknowledged
+        while True:
+            message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                return "disconnected"
+            data = message.get("bytes")
+            if message.get("text"):
+                try:
+                    control = json.loads(message["text"])
+                except (ValueError, TypeError):
+                    control = {}
+                if control.get("type") == "proposal_presented":
+                    accepted = (proposal_audio_complete and not proposal_acknowledged and
+                        adapter.mark_proposal_presented(str(control.get("proposal_id", "")), str(control.get("proposal_hash", ""))))
+                    proposal_acknowledged = accepted or proposal_acknowledged
+                    await ws.send_json({"type": "proposal_ack", "accepted": accepted})
+                continue
+            if data is None:
+                continue
+            if len(data) > 16384 or len(data) % 2:
+                await ws.send_json({"type": "error", "code": "invalid_audio_frame"})
+                continue
+            audio_bytes += len(data)
+            if audio_bytes > max_audio_bytes:
+                await ws.send_json({"type": "error", "code": "audio_limit_reached", "message": "Continue by text."})
+                try:
+                    await ws.close(code=1008, reason="audio_limit_reached")
+                except Exception:
+                    pass
+                return "audio_limit"
+            await session.send_realtime_input(audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000"))
+
+    async def receive_model():
+        nonlocal language, latest_user_turn, allow_model_audio, proposal_audio_complete
+        nonlocal proposal_acknowledged, proposal_audio_expected, latest_response_id, resolve_end_requested, end_deadline, ended_reason
+
+        async def process_tool_calls(calls):
+            nonlocal latest_user_turn, allow_model_audio, proposal_audio_expected
+            nonlocal proposal_audio_complete, proposal_acknowledged, latest_response_id
+            nonlocal resolve_end_requested, end_deadline
+            for call in calls:
+                if call.name != VOICE_TOOLS[0]["name"] or not latest_user_turn:
+                    response = {"error": "no_finalized_caller_turn"}
+                else:
+                    final_text = latest_user_turn
+                    latest_user_turn = ""
+                    response = await tools.execute(call.name, transcript=final_text, language=language)
+                    if not response.get("error"):
+                        latest_response_id = response.get("response_id")
+                        proposal_audio_expected = bool(response.get("proposal"))
+                        proposal_audio_complete = False
+                        proposal_acknowledged = False
+                        resolve_end_requested = bool(response.get("end_session", False))
+                        if resolve_end_requested:
+                            end_deadline = time.monotonic() + end_session_timeout_seconds
+                        await ws.send_json({
+                            "type": "resolve_result", "response_id": latest_response_id,
+                            "case_id": response.get("case_id"), "reply_text": response.get("reply_text"),
+                            "pending_question": response.get("pending_question"), "proposal": response.get("proposal"),
+                            "operation_status": response.get("operation_status"), "end_session": resolve_end_requested,
+                        })
+                await session.send_tool_response(function_responses=[types.FunctionResponse(id=call.id, name=call.name, response={"output": response})])
+                allow_model_audio = True
+
+        while True:
+            saw_event = False
+            iterator = aiter(session.receive())
+            while True:
+                try:
+                    if end_deadline is None:
+                        event = await iterator.__anext__()
+                    else:
+                        event = await asyncio.wait_for(iterator.__anext__(), timeout=max(0.01, end_deadline - time.monotonic()))
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    ended_reason = "resolve_requested"
+                    await ws.send_json({"type": "ended", "reason": ended_reason})
+                    try:
+                        await ws.close(code=1000, reason=ended_reason)
+                    except Exception:
+                        pass
+                    return "ended"
+                saw_event = True
+                content = getattr(event, "server_content", None)
+                was_interrupted = bool(content and getattr(content, "interrupted", False))
+                if was_interrupted:
+                    proposal_audio_complete = False
+                    proposal_acknowledged = False
+                    proposal_audio_expected = False
+                    adapter.presented_proposal = None
+                    await ws.send_json({"type": "interrupted", "response_id": latest_response_id})
+                transcript = getattr(content, "input_transcription", None) if content else None
+                if transcript and getattr(transcript, "text", None):
+                    input_fragments.append(transcript.text)
+                if transcript and getattr(transcript, "finished", False):
+                    if input_fragments:
+                        latest_user_turn = " ".join(part.strip() for part in input_fragments if part.strip()).strip()
+                        input_fragments.clear()
+                        allow_model_audio = False
+                        proposal_audio_complete = False
+                        proposal_acknowledged = False
+                        if latest_user_turn:
+                            decision = detect_language(latest_user_turn)
+                            language = decision.language or language
+                            await ws.send_json({"type": "transcript", "speaker": "user", "text": latest_user_turn, "final": True})
+                output_transcript = getattr(content, "output_transcription", None) if content else None
+                if allow_model_audio and output_transcript and getattr(output_transcript, "text", None):
+                    await ws.send_json({"type": "transcript", "speaker": "assistant", "text": output_transcript.text, "final": bool(getattr(content, "turn_complete", False))})
+                if content:
+                    for part in (getattr(getattr(content, "model_turn", None), "parts", None) or []):
+                        inline = getattr(part, "inline_data", None)
+                        if allow_model_audio and inline and getattr(inline, "data", None):
+                            await ws.send_bytes(inline.data)
+                    if getattr(content, "turn_complete", False) and proposal_audio_expected and not was_interrupted:
+                        proposal_audio_complete = True
+                        proposal_audio_expected = False
+                tool_call = getattr(event, "tool_call", None)
+                calls = getattr(tool_call, "function_calls", None) or []
+                pending_tool_calls.extend(calls)
+                if latest_user_turn and pending_tool_calls:
+                    ready_calls, pending_tool_calls[:] = pending_tool_calls[:], []
+                    await process_tool_calls(ready_calls)
+                if content and getattr(content, "turn_complete", False) and resolve_end_requested:
+                    ended_reason = "resolve_requested"
+                    await ws.send_json({"type": "ended", "reason": ended_reason})
+                    try:
+                        await ws.close(code=1000, reason=ended_reason)
+                    except Exception:
+                        pass
+                    return "ended"
+                if getattr(event, "go_away", None):
+                    await ws.send_json({"type": "error", "code": "voice_session_ending", "message": "Continue by text if this call disconnects."})
+            if not saw_event:
+                return "provider_disconnected"
+    audio_task = asyncio.create_task(receive_audio(), name=f"hutch-audio-{session_id}")
+    model_task = asyncio.create_task(receive_model(), name=f"hutch-model-{session_id}")
+    tasks = {audio_task, model_task}
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=max_session_seconds, return_when=asyncio.FIRST_COMPLETED)
+        if not done:
+            try:
+                await ws.send_json({"type": "ended", "reason": "session_limit"})
+                await ws.close(code=1000, reason="session_limit")
+            except Exception:
+                pass
+            return "session_limit"
+        for task in done:
+            result = task.result()
+            if task is audio_task and result == "audio_limit":
+                return result
+            if task is model_task and result == "ended":
+                return result
+            if task is model_task and result == "provider_disconnected":
+                try:
+                    await ws.send_json({"type": "error", "code": "voice_provider_disconnected", "message": "Voice disconnected. Continue by text."})
+                    await ws.close(code=1011, reason="provider_disconnected")
+                except Exception:
+                    pass
+                return result
+            # A completed model iterator is restarted internally; a socket reader only
+            # returns on disconnect or a bounded audio-limit closure.
+            if task is audio_task and result == "disconnected":
+                return result
+        return "disconnected"
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 @app.websocket("/ws/hutch/{session_id}")
 async def hutch_audio_socket(ws: WebSocket, session_id: str):
     origin = (ws.headers.get("origin") or "").rstrip("/")
@@ -193,20 +384,13 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
     client = genai.Client(api_key=api_key)
     runtime_config = VoiceRuntimeConfig.from_environment()
     model = runtime_config.model
-    language = "en"
-    input_fragments: list[str] = []
-    latest_user_turn = ""
-    allow_model_audio = False
-    proposal_audio_complete = False
-    proposal_acknowledged = False
     tool_declarations = [types.Tool(function_declarations=[types.FunctionDeclaration(
         name=VOICE_TOOLS[0]["name"], description=VOICE_TOOLS[0]["description"],
         parameters_json_schema=VOICE_TOOLS[0]["parameters"]
     )])]
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"], temperature=0.2,
-        system_instruction=SYSTEM_INSTRUCTION,
-        tools=tool_declarations,
+        system_instruction=SYSTEM_INSTRUCTION, tools=tool_declarations,
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         realtime_input_config=types.RealtimeInputConfig(
@@ -223,103 +407,13 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
         async with _live_session(client, model, config) as session:
             await ws.send_json({"type": "ready", "session_id": session_id, "provider": "gemini_live", "model": model, "live_profile": runtime_config.profile, "features": {"full_duplex":runtime_config.full_duplex,"context_compression":runtime_config.context_compression,"protocol_version":runtime_config.protocol_version}, "input_format": {"encoding": "pcm_s16le", "sample_rate": 16000}, "output_format": {"encoding": "pcm_s16le", "sample_rate": 24000}})
             await ws.send_json({"type": "greeting", "text": "HUTCH Resolve demo. Tell me what you need help with."})
-
-            async def receive_audio():
-                nonlocal proposal_audio_complete, proposal_acknowledged
-                total_bytes = 0
-                while True:
-                    message = await ws.receive()
-                    if message.get("type") == "websocket.disconnect":
-                        return
-                    data = message.get("bytes")
-                    if message.get("text"):
-                        try:
-                            control = json.loads(message["text"])
-                        except (ValueError, TypeError):
-                            control = {}
-                        if control.get("type") == "proposal_presented":
-                            accepted = (proposal_audio_complete and not proposal_acknowledged and
-                                adapter.mark_proposal_presented(str(control.get("proposal_id", "")), str(control.get("proposal_hash", ""))))
-                            proposal_acknowledged = accepted or proposal_acknowledged
-                            await ws.send_json({"type": "proposal_ack", "accepted": accepted})
-                        continue
-                    if data is None:
-                        continue
-                    if len(data) > 16384 or len(data) % 2:
-                        await ws.send_json({"type": "error", "code": "invalid_audio_frame"})
-                        continue
-                    total_bytes += len(data)
-                    if total_bytes > int(os.getenv("HUTCH_VOICE_MAX_AUDIO_BYTES", "3840000")):
-                        await ws.send_json({"type": "error", "code": "audio_limit_reached", "message": "Continue by text."})
-                        await ws.close(code=1008, reason="audio_limit_reached")
-                        return
-                    await session.send_realtime_input(audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000"))
-
-            async def receive_model():
-                nonlocal language, latest_user_turn, allow_model_audio, proposal_audio_complete, proposal_acknowledged
-                async for event in session.receive():
-                    content = getattr(event, "server_content", None)
-                    transcript = getattr(content, "input_transcription", None) if content else None
-                    if transcript and getattr(transcript, "text", None):
-                        input_fragments.append(transcript.text)
-                        if getattr(content, "turn_complete", False):
-                            latest_user_turn = " ".join(input_fragments).strip()
-                            input_fragments.clear()
-                            allow_model_audio = False
-                            proposal_audio_complete = False
-                            proposal_acknowledged = False
-                            if latest_user_turn:
-                                decision = detect_language(latest_user_turn)
-                                language = decision.language or language
-                                await ws.send_json({"type": "transcript", "speaker": "user", "text": latest_user_turn, "final": True})
-                    output_transcript = getattr(content, "output_transcription", None) if content else None
-                    if output_transcript and getattr(output_transcript, "text", None):
-                        await ws.send_json({"type": "transcript", "speaker": "assistant", "text": output_transcript.text, "final": bool(getattr(content, "turn_complete", False))})
-                    if content:
-                        for part in (getattr(getattr(content, "model_turn", None), "parts", None) or []):
-                            inline = getattr(part, "inline_data", None)
-                            if allow_model_audio and inline and getattr(inline, "data", None):
-                                await ws.send_bytes(inline.data)
-                        if getattr(content, "turn_complete", False) and adapter.pending_proposal:
-                            proposal_audio_complete = True
-                    tool_call = getattr(event, "tool_call", None)
-                    calls = getattr(tool_call, "function_calls", None) or []
-                    if calls:
-                        for call in calls:
-                            response: dict
-                            if call.name != VOICE_TOOLS[0]["name"] or not latest_user_turn:
-                                response = {"error": "no_finalized_caller_turn"}
-                            else:
-                                final_text = latest_user_turn
-                                latest_user_turn = ""
-                                response = await tools.execute(call.name, transcript=final_text, language=language)
-                                if not response.get("error"):
-                                    await ws.send_json({
-                                        "type": "resolve_result",
-                                        "response_id": response.get("response_id"),
-                                        "case_id": response.get("case_id"),
-                                        "reply_text": response.get("reply_text"),
-                                        "pending_question": response.get("pending_question"),
-                                        "proposal": response.get("proposal"),
-                                        "operation_status": response.get("operation_status"),
-                                        "end_session": response.get("end_session", False),
-                                    })
-                            await session.send_tool_response(function_responses=[types.FunctionResponse(id=call.id, name=call.name, response={"output": response})])
-                            allow_model_audio = True
-                    if getattr(event, "go_away", None):
-                        await ws.send_json({"type": "error", "code": "voice_session_ending", "message": "Continue by text if this call disconnects."})
-
-            audio_task = asyncio.create_task(receive_audio())
-            model_task = asyncio.create_task(receive_model())
-            done, pending = await asyncio.wait({audio_task, model_task}, timeout=int(os.getenv("HUTCH_VOICE_MAX_SESSION_SECONDS", "120")), return_when=asyncio.FIRST_COMPLETED)
-            if not done:
-                raise asyncio.TimeoutError
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                if not task.cancelled() and task.exception():
-                    raise task.exception()
+            await _run_hutch_live_session(
+                ws=ws, session=session, tools=tools, adapter=adapter,
+                binding_id=binding["binding_id"], session_id=session_id,
+                max_audio_bytes=int(os.getenv("HUTCH_VOICE_MAX_AUDIO_BYTES", "3840000")),
+                max_session_seconds=int(os.getenv("HUTCH_VOICE_MAX_SESSION_SECONDS", "120")),
+                end_session_timeout_seconds=float(os.getenv("HUTCH_VOICE_END_SESSION_TIMEOUT_SECONDS", "5")),
+            )
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     except asyncio.TimeoutError:
