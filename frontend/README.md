@@ -1,9 +1,10 @@
 # HUTCH Resolve Voice frontend
 
-Standalone customer voice call page for HUTCH Resolve: a dark "Talk to Resolve" page with one call panel
-(status line, microphone orb, live captions, the offer to confirm and the action's progress). It is a
-separate UI from the Resolve text chat but keeps its brand colour, fonts, languages and confirmation rules,
-and it implements the browser side of Voice protocol `zeptaz-hutch-v2`.
+Standalone customer voice call page for HUTCH Resolve: a "Talk to Resolve" page with one call panel
+(status chip, call button, live captions, the offer to confirm and the action's progress). It is a separate
+page from the Resolve text chat but uses the chat's theme and components: header, soft grey panels, orange
+accent, solid status chips, chat bubbles, confirmation and action cards, languages and confirmation rules.
+It implements the browser side of Voice protocol `zeptaz-hutch-v2`.
 
 ```text
 browser ──/api (proxy)──▶ Resolve :8080   sign-in, conversation, voice grant, cards, operations, receipts

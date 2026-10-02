@@ -239,15 +239,3 @@
   }
 }
 
-/* Voice page: a faint dot grid behind everything, and an orange glow inside the call panel. */
-.voice-backdrop {
-  background-color: var(--background);
-  background-image: radial-gradient(color-mix(in oklch, var(--foreground) 8%, transparent) 1px, transparent 1px);
-  background-size: 28px 28px;
-}
-
-.voice-glow {
-  background: radial-gradient(70% 42% at 50% 30%, color-mix(in oklch, var(--primary) 60%, transparent), transparent 78%);
-  opacity: 0.45;
-  transition: opacity 0.4s ease;
-}

@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { MessageCircleWarning, Mic, MicOff, PhoneOff, Timer, Volume2, Zap } from 'lucide-react'
+import { Activity, MessageCircleWarning, Mic, MicOff, PhoneOff, ShieldCheck, Timer, Volume2, Zap } from 'lucide-react'
 import { API_MODE, newId } from '@/api/client'
 import { customerApi } from '@/api/endpoints'
 import { describeError, isApiError } from '@/api/errors'
 import type { Decision, OperationView, SessionView, VoiceProposal } from '@/api/types'
+import { CardFrame } from '@/components/CardFrame'
+import { Bubble } from '@/components/chat'
 import { ErrorState, LoadingState } from '@/components/states'
-import { OperationBadge } from '@/components/StatusBadge'
+import { OperationBadge, StatusBadge } from '@/components/StatusBadge'
+import { operationTone, type Tone } from '@/components/tones'
 import { Button } from '@/components/ui/button'
 import { hasMessage, useI18n, type Translate } from '@/i18n/context'
 import { formatTime, humanize } from '@/lib/format'
@@ -93,7 +96,6 @@ function CallPanel({ conversationId }: { conversationId: string }) {
   const [caption, setCaption] = useState<Caption>({ user: null, reply: null })
   const [offer, setOffer] = useState<Offer | null>(null)
   const [operation, setOperation] = useState<OperationView | null>(null)
-  const glowRef = useRef<HTMLDivElement>(null)
 
   /** Follow the latest action Resolve started until the provider settles it. UNKNOWN keeps polling. */
   const watchLatestOperation = useCallback(async () => {
@@ -127,26 +129,7 @@ function CallPanel({ conversationId }: { conversationId: string }) {
     return () => call.dispose()
   }, [call, watchLatestOperation])
 
-  // The panel's glow follows whoever is talking.
   const live = state.phase === 'live'
-  useEffect(() => {
-    const el = glowRef.current
-    if (!el) return
-    if (!live) {
-      el.style.opacity = ''
-      return
-    }
-    let frame = 0
-    let level = 0
-    const tick = () => {
-      const { mic, speaker } = call.levels
-      level += (Math.max(mic, speaker) - level) * 0.2
-      el.style.opacity = String(0.6 + level * 0.4)
-      frame = requestAnimationFrame(tick)
-    }
-    frame = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(frame)
-  }, [call, live])
 
   /** Explicit Yes/No by tap, for when an offer can't be confirmed by voice. Resolve receives it as a text turn. */
   const answerByTap = async (decision: Decision) => {
@@ -175,8 +158,8 @@ function CallPanel({ conversationId }: { conversationId: string }) {
 
   return (
     <>
-      <Panel glowRef={glowRef}>
-        <div className="flex flex-col items-center gap-7 text-center">
+      <Panel>
+        <div className="flex flex-col items-center gap-6 text-center">
           <StatusLine state={state} t={t} />
           <Orb call={call} state={state} label={state.phase === 'ended' ? t('voice.callAgain') : t('voice.start')} />
           <Captions caption={caption} state={state} t={t} />
@@ -190,21 +173,25 @@ function CallPanel({ conversationId }: { conversationId: string }) {
   )
 }
 
+const ACTIVITY_TONE: Record<CallState['activity'], Tone> = { listening: 'success', thinking: 'warning', speaking: 'info' }
+
+/** Call state as one of the chat's status chips. */
 function StatusLine({ state, t }: { state: CallState; t: Translate }) {
   const { phase, activity, muted } = state
-  const value =
+  const [label, tone]: [string, Tone] =
     phase === 'live'
       ? muted && activity === 'listening'
-        ? t('voice.state.muted')
-        : t(`voice.state.${activity}`)
+        ? [t('voice.state.muted'), 'neutral']
+        : [t(`voice.state.${activity}`), ACTIVITY_TONE[activity]]
       : phase === 'requesting' || phase === 'connecting'
-        ? t(`voice.state.${phase}`)
+        ? [t(`voice.state.${phase}`), 'info']
         : phase === 'ended'
-          ? t('voice.state.ended')
-          : t('voice.state.idle')
+          ? [t('voice.state.ended'), 'neutral']
+          : [t('voice.state.idle'), 'neutral']
   return (
-    <p aria-live="polite" className="text-xs font-semibold tracking-[0.28em] uppercase">
-      {t('voice.status')}:<span className="ml-3 text-primary">{value}</span>
+    <p aria-live="polite" className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+      {t('voice.status')}
+      <StatusBadge tone={tone}>{label}</StatusBadge>
     </p>
   )
 }
@@ -212,9 +199,9 @@ function StatusLine({ state, t }: { state: CallState; t: Translate }) {
 const BARS = [0.5, 0.8, 1, 0.75, 0.45]
 
 /**
- * A white disc, as in the reference. Idle it is the call button and breathes; connecting it is
- * ringed by a spinner; listening, a ring follows the microphone; thinking, dots pulse; speaking,
- * orange bars follow Resolve's voice. Levels are written straight to the DOM every frame.
+ * Idle: the orange call button, breathing. Connecting: a spinning arc. Listening: a halo that follows
+ * the microphone. Thinking: pulsing dots (the chat's typing dots). Speaking: bars that follow Resolve's
+ * voice. Levels are written straight to the DOM every frame, so React doesn't re-render at 60 fps.
  */
 function Orb({ call, state, label }: { call: VoiceCall; state: CallState; label: string }) {
   const ring = useRef<HTMLSpanElement>(null)
@@ -246,46 +233,55 @@ function Orb({ call, state, label }: { call: VoiceCall; state: CallState; label:
 
   const face =
     live && activity === 'speaking' ? (
-      <span ref={bars} className="flex h-14 items-center gap-2 text-primary">
+      <span ref={bars} className="flex h-12 items-center gap-1.5">
         {BARS.map((_, i) => (
-          <span key={i} className="h-full w-2 rounded-full bg-current" style={{ transform: 'scaleY(0.2)' }} />
+          <span key={i} className="h-full w-1.5 rounded-full bg-current" style={{ transform: 'scaleY(0.2)' }} />
         ))}
       </span>
     ) : live && activity === 'thinking' ? (
       <span className="flex items-center gap-2">
         {[0, 160, 320].map((d) => (
-          <span key={d} className="size-3 animate-typing-dot rounded-full bg-current" style={{ animationDelay: `${d}ms` }} />
+          <span key={d} className="size-2.5 animate-typing-dot rounded-full bg-current" style={{ animationDelay: `${d}ms` }} />
         ))}
       </span>
     ) : muted ? (
-      <MicOff className="size-12" />
+      <MicOff className="size-10 text-muted-foreground" />
     ) : (
-      <Mic className="size-12" />
+      <Mic className="size-10" />
     )
 
   return (
-    <div className="relative grid size-56 place-items-center">
-      {idle && <span aria-hidden className="absolute inset-6 animate-orb-breathe rounded-full bg-white/15" />}
-      {live && <span ref={ring} aria-hidden className="absolute inset-5 rounded-full border-2 border-white/25 bg-white/5" />}
+    <div className="relative grid size-44 place-items-center">
+      {idle && <span aria-hidden className="absolute inset-4 animate-orb-breathe rounded-full bg-primary/25" />}
+      {live && (
+        <span
+          ref={ring}
+          aria-hidden
+          className={cn('absolute inset-5 rounded-full transition-colors duration-300', activity === 'speaking' ? 'bg-primary/20' : 'bg-primary/15')}
+        />
+      )}
       {(phase === 'requesting' || phase === 'connecting') && (
-        <span aria-hidden className="absolute inset-3 animate-spin rounded-full border-4 border-white/10 border-t-primary [animation-duration:1.1s]" />
+        <span aria-hidden className="absolute inset-3 animate-spin rounded-full border-4 border-muted border-t-primary [animation-duration:1.1s]" />
       )}
       {idle ? (
         <button
           type="button"
           onClick={() => void call.start()}
-          className="relative grid size-44 place-items-center rounded-full bg-white text-neutral-950 shadow-xl shadow-black/40 transition-transform outline-none hover:scale-[1.03] focus-visible:ring-4 focus-visible:ring-primary/60 active:scale-95"
+          className="relative grid size-28 place-items-center rounded-full bg-primary text-primary-foreground shadow-lg shadow-primary/30 transition-transform outline-none hover:scale-105 focus-visible:ring-4 focus-visible:ring-ring/50 active:scale-95"
         >
-          <Mic aria-hidden className="size-12" />
+          <Mic aria-hidden className="size-10" />
           <span className="sr-only">{label}</span>
         </button>
       ) : (
         <span
           aria-hidden
           className={cn(
-            'relative grid size-44 place-items-center rounded-full bg-white text-neutral-950 shadow-xl shadow-black/40 transition-opacity',
-            !live && 'opacity-80',
-            live && activity === 'thinking' && 'animate-thinking-ring',
+            'relative grid size-28 place-items-center rounded-full shadow-md transition-colors duration-300',
+            live && activity === 'speaking'
+              ? 'bg-primary text-primary-foreground'
+              : live && activity === 'thinking'
+                ? 'animate-thinking-ring bg-accent text-accent-foreground'
+                : 'bg-card text-foreground ring-1 ring-border',
           )}
         >
           {face}
@@ -307,18 +303,18 @@ function Captions({ caption, state, t }: { caption: Caption; state: CallState; t
     )
   }
   return (
-    <div className="flex w-full flex-col gap-3" aria-live="polite">
+    <div className="flex w-full flex-col gap-3 text-left" aria-live="polite">
       {caption.user && (
-        <p key={`u-${caption.user}`} className="animate-bubble-in text-sm text-muted-foreground">
-          <span className="font-semibold text-foreground/80">{t('voice.you')}: </span>“{caption.user}”
-        </p>
+        <Bubble key={`u-${caption.user}`} speaker="USER" spoken animate>
+          {caption.user}
+        </Bubble>
       )}
       {caption.reply && (
-        <p key={caption.reply.id} className="animate-bubble-in text-lg leading-relaxed font-medium text-balance">
+        <Bubble key={caption.reply.id} speaker="ASSISTANT" spoken animate>
           {caption.reply.text}
-        </p>
+        </Bubble>
       )}
-      {caption.reply?.fallback && <p className="text-xs text-muted-foreground">{t('voice.fallback')}</p>}
+      {caption.reply?.fallback && <p className="text-[11px] text-muted-foreground sm:ml-9">{t('voice.fallback')}</p>}
       {notice && <Notice text={notice} error={!!state.error} />}
     </div>
   )
@@ -377,21 +373,39 @@ function OfferBox({
         ? { icon: null, text: t('voice.proposal.notByVoice') }
         : null
   return (
-    <section aria-label={t('voice.proposal.title')} className="w-full animate-bubble-in rounded-2xl border border-primary/40 bg-white/[0.04] p-4 text-left">
-      <p className="text-[11px] font-semibold tracking-[0.2em] text-primary uppercase">{t('voice.proposal.title')}</p>
-      <p className="mt-2 font-semibold">{hasMessage(`action.${p.action_type}`) ? t(`action.${p.action_type}`) : humanize(p.action_type)}</p>
-      <p className="text-sm">{p.target_label}</p>
-      <p className="mt-1.5 text-sm text-muted-foreground">{p.consequences}</p>
-      <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
-        <Timer aria-hidden className="size-3.5" />
-        {expired ? t('confirm.expired') : t('confirm.validUntil', { time: formatTime(p.expires_at), left })}
-      </p>
+    <CardFrame
+      icon={<ShieldCheck />}
+      title={t('voice.proposal.title')}
+      tone={expired ? 'neutral' : 'warning'}
+      aside={<StatusBadge tone={expired ? 'neutral' : 'warning'}>{expired ? t('confirm.expired') : t('confirm.waiting')}</StatusBadge>}
+      className="w-full animate-bubble-in bg-card text-left"
+    >
+      <dl className="flex flex-col gap-2">
+        <div>
+          <dt className="text-xs text-muted-foreground">{t('confirm.action')}</dt>
+          <dd className="font-medium">{hasMessage(`action.${p.action_type}`) ? t(`action.${p.action_type}`) : humanize(p.action_type)}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted-foreground">{t('confirm.appliesTo')}</dt>
+          <dd>{p.target_label}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted-foreground">{t('confirm.means')}</dt>
+          <dd>{p.consequences}</dd>
+        </div>
+      </dl>
+      {!expired && (
+        <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Timer aria-hidden className="size-3.5" />
+          {t('confirm.validUntil', { time: formatTime(p.expires_at), left })}
+        </p>
+      )}
       {voiceLine && (
         <p
           aria-live="polite"
           className={cn(
             'mt-3 flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium [&_svg]:size-4 [&_svg]:shrink-0',
-            voiceStatus === 'awaiting' ? 'bg-primary text-primary-foreground' : 'bg-white/5',
+            voiceStatus === 'awaiting' ? 'bg-primary text-primary-foreground' : 'bg-muted',
           )}
         >
           {voiceLine.icon && (
@@ -406,10 +420,10 @@ function OfferBox({
         <div className="mt-3 flex flex-col gap-2">
           {live && <p className="text-xs text-muted-foreground">{t('voice.offer.answerByTap')}</p>}
           <div className="flex flex-wrap gap-2" role="group" aria-label={t('confirm.group')}>
-            <Button className="rounded-full" disabled={offer.answer !== 'idle'} onClick={() => onAnswer('ACCEPT')}>
+            <Button className="h-auto py-2 whitespace-normal" disabled={offer.answer !== 'idle'} onClick={() => onAnswer('ACCEPT')}>
               {t('confirm.yes')}
             </Button>
-            <Button variant="outline" className="rounded-full border-white/15 bg-white/5" disabled={offer.answer !== 'idle'} onClick={() => onAnswer('DECLINE')}>
+            <Button variant="outline" className="h-auto py-2 whitespace-normal" disabled={offer.answer !== 'idle'} onClick={() => onAnswer('DECLINE')}>
               {t('confirm.no')}
             </Button>
           </div>
@@ -420,7 +434,7 @@ function OfferBox({
           )}
         </div>
       )}
-    </section>
+    </CardFrame>
   )
 }
 
@@ -428,13 +442,15 @@ function ActionStatus({ op, t }: { op: OperationView; t: Translate }) {
   const title = hasMessage(`op.${op.action_type}`) ? t(`op.${op.action_type}`) : humanize(op.action_type)
   const text = op.status === 'SUCCEEDED' && hasMessage(`op.done.${op.action_type}`) ? t(`op.done.${op.action_type}`) : t(`op.${op.status}`)
   return (
-    <div aria-live="polite" className="flex w-full animate-bubble-in flex-col gap-1 rounded-2xl bg-white/[0.04] p-4 text-left">
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-sm font-semibold">{title}</p>
-        <OperationBadge status={op.status} />
-      </div>
-      <p className="text-sm text-muted-foreground">{text}</p>
-    </div>
+    <CardFrame
+      icon={<Activity />}
+      title={title}
+      tone={operationTone[op.status]}
+      aside={<OperationBadge status={op.status} />}
+      className="w-full animate-bubble-in bg-card text-left"
+    >
+      <p aria-live="polite">{text}</p>
+    </CardFrame>
   )
 }
 
@@ -449,7 +465,7 @@ function Controls({ call, state, t }: { call: VoiceCall; state: CallState; t: Tr
         <Button
           variant="outline"
           size="lg"
-          className="rounded-full border-white/15 bg-white/5"
+          className="bg-card"
           aria-pressed={state.muted}
           disabled={!live}
           onClick={() => call.setMuted(!state.muted)}
@@ -457,7 +473,7 @@ function Controls({ call, state, t }: { call: VoiceCall; state: CallState; t: Tr
           {state.muted ? <MicOff aria-hidden /> : <Mic aria-hidden />}
           {state.muted ? t('voice.unmute') : t('voice.mute')}
         </Button>
-        <Button size="lg" className="rounded-full bg-destructive text-white hover:bg-destructive/90" onClick={() => call.stop()}>
+        <Button size="lg" variant="destructive" onClick={() => call.stop()}>
           <PhoneOff aria-hidden /> {t('voice.end')}
         </Button>
       </div>
@@ -506,7 +522,7 @@ function TrySaying({ live, t }: { live: boolean; t: Translate }) {
   const say = (text: string) => run((m) => m.say(text))
   return (
     <section aria-label={t('voice.trySaying')} className="flex flex-col gap-3">
-      <h2 className="text-center text-xs font-semibold tracking-[0.28em] text-muted-foreground uppercase">{t('voice.trySaying')}</h2>
+      <h2 className="text-sm font-semibold">{t('voice.trySaying')}</h2>
       <ul className="flex flex-col gap-2">
         {EXAMPLES.map((key) => (
           <li key={key}>
@@ -514,22 +530,22 @@ function TrySaying({ live, t }: { live: boolean; t: Translate }) {
               <button
                 type="button"
                 onClick={() => say(t(key))}
-                className="w-full rounded-2xl border border-white/10 bg-card/60 px-4 py-3 text-left text-sm transition-colors hover:border-primary/50 hover:bg-card focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:outline-none"
+                className="w-full rounded-2xl bg-muted/70 px-4 py-2.5 text-left text-sm font-medium transition-colors hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
               >
                 “{t(key)}”
               </button>
             ) : (
-              <p className="rounded-2xl border border-white/10 bg-card/40 px-4 py-3 text-sm text-muted-foreground">“{t(key)}”</p>
+              <p className="rounded-2xl bg-muted/70 px-4 py-2.5 text-sm text-muted-foreground">“{t(key)}”</p>
             )}
           </li>
         ))}
       </ul>
       {mock && (
-        <div className="flex flex-col gap-2 rounded-2xl border border-dashed border-white/15 p-3">
+        <div className="flex flex-col gap-2 rounded-2xl border border-dashed border-foreground/20 p-3">
           <p className="text-xs text-muted-foreground">{t('voice.mock.note')}</p>
           <div className="flex flex-wrap gap-1.5">
             {['Yes, go ahead', 'No, leave it', 'Thanks, that is all'].map((line) => (
-              <Button key={line} variant="outline" size="sm" className="rounded-full border-white/15 bg-white/5" onClick={() => say(line)}>
+              <Button key={line} variant="outline" size="sm" className="h-auto rounded-full border-transparent bg-muted/70 py-1.5 whitespace-normal hover:bg-muted" onClick={() => say(line)}>
                 “{line}”
               </Button>
             ))}

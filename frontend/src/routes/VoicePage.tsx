@@ -16,14 +16,14 @@ import { CustomerSessionProvider } from '@/session/providers'
 import { VoiceShell } from './VoiceShell'
 
 /**
- * A standalone call page, separate from the Resolve text chat: one headline, one call panel.
- * Dark by design so the panel's glow carries the call state.
+ * A standalone call page, separate from the Resolve text chat but in its theme: same header,
+ * soft panels, orange accent, status chips and bubbles. One headline, one call panel.
  */
 export default function VoicePage() {
   return (
     <LanguageProvider>
       <CustomerSessionProvider>
-        <div className="voice-backdrop flex min-h-dvh flex-col">
+        <div className="flex min-h-dvh flex-col">
           <SimulationBanner />
           <Page />
         </div>
@@ -42,31 +42,29 @@ function Page() {
 
   return (
     <>
-      <header className="sticky top-[env(safe-area-inset-top,0px)] z-20 px-4 pt-4">
-        <nav className="mx-auto flex max-w-3xl items-center justify-between gap-3 rounded-full border border-white/10 bg-card/70 py-2.5 pr-2.5 pl-6 shadow-lg shadow-black/30 backdrop-blur">
-          <BrandMark />
-          <div className="flex items-center gap-1.5">
-            <LanguageToggle value={language} onChange={setLanguage} label={t('lang.label')} />
-            {signedIn && (
-              <Button variant="ghost" size="icon-sm" className="rounded-full" onClick={() => void logout()} aria-label={t('voice.signOut')} title={t('voice.signOut')}>
-                <LogOut aria-hidden />
-              </Button>
-            )}
-          </div>
-        </nav>
+      <header className="flex items-center justify-between gap-3 border-b px-4 py-3">
+        <BrandMark subtitle={t('brand.voiceSubtitle')} />
+        <div className="flex items-center gap-2">
+          <LanguageToggle value={language} onChange={setLanguage} label={t('lang.label')} />
+          {signedIn && (
+            <Button variant="ghost" size="icon-sm" onClick={() => void logout()} aria-label={t('voice.signOut')} title={t('voice.signOut')}>
+              <LogOut aria-hidden />
+            </Button>
+          )}
+        </div>
       </header>
 
-      <main className="flex flex-1 flex-col items-center px-4 pt-12 pb-10">
-        <div className="flex max-w-xl flex-col items-center gap-4 text-center">
-          <h1 className="text-4xl font-bold tracking-tight text-balance sm:text-5xl">
+      <main className="flex flex-1 flex-col items-center px-4 pt-10 pb-10">
+        <div className="flex max-w-xl flex-col items-center gap-3 text-center">
+          <h1 className="text-3xl font-bold tracking-tight text-balance sm:text-4xl">
             {before}
             <span className="text-primary">Resolve</span>
             {after}
           </h1>
-          <p className="max-w-md text-base leading-relaxed text-balance text-muted-foreground">{t('voice.heroBody')}</p>
+          <p className="max-w-md text-sm leading-relaxed text-balance text-muted-foreground sm:text-base">{t('voice.heroBody')}</p>
         </div>
 
-        <div className="mt-10 flex w-full max-w-md flex-col gap-8">
+        <div className="mt-8 flex w-full max-w-md flex-col gap-6">
           {signedIn ? (
             <VoiceShell session={session} />
           ) : (
@@ -87,14 +85,9 @@ function Page() {
   )
 }
 
-/** The rounded call card with an orange glow. `glow` is a CSS opacity, 0..1. */
-export function Panel({ children, glowRef }: { children: ReactNode; glowRef?: React.Ref<HTMLDivElement> }) {
-  return (
-    <section className="relative isolate overflow-hidden rounded-[2rem] border border-white/10 bg-card px-6 py-10 shadow-2xl shadow-black/40">
-      <div ref={glowRef} aria-hidden className="voice-glow pointer-events-none absolute inset-0 -z-10" />
-      {children}
-    </section>
-  )
+/** The call panel: the chat's soft grey tile, larger. */
+export function Panel({ children }: { children: ReactNode }) {
+  return <section className="rounded-3xl bg-muted/70 px-5 py-8 sm:px-8">{children}</section>
 }
 
 function SignIn({ expired, onSignIn }: { expired: boolean; onSignIn: (body: { demo_identity: string; credential: string }) => Promise<void> }) {
@@ -124,7 +117,7 @@ function SignIn({ expired, onSignIn }: { expired: boolean; onSignIn: (body: { de
       </div>
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="identity">{t('voice.identity')}</Label>
-        <Input id="identity" autoComplete="username" required value={identity} onChange={(e) => setIdentity(e.target.value)} className="h-10 rounded-xl" />
+        <Input id="identity" autoComplete="username" required value={identity} onChange={(e) => setIdentity(e.target.value)} className="bg-card" />
       </div>
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="credential">{t('voice.credential')}</Label>
@@ -135,7 +128,7 @@ function SignIn({ expired, onSignIn }: { expired: boolean; onSignIn: (body: { de
           required
           value={credential}
           onChange={(e) => setCredential(e.target.value)}
-          className="h-10 rounded-xl"
+          className="bg-card"
         />
       </div>
       {error != null && (
@@ -143,7 +136,7 @@ function SignIn({ expired, onSignIn }: { expired: boolean; onSignIn: (body: { de
           {describeError(error, t)}
         </p>
       )}
-      <Button type="submit" size="lg" className="h-11 rounded-full" disabled={busy || !identity.trim() || !credential}>
+      <Button type="submit" disabled={busy || !identity.trim() || !credential}>
         {busy ? t('voice.signingIn') : t('voice.signIn')}
       </Button>
     </form>
