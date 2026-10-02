@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import time
+import unicodedata
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -147,12 +149,56 @@ async def hutch_lifecycle_event(request: Request,
 
 
 def _grant_from_protocol(header: str) -> tuple[str, str] | None:
-    common = "zeptaz-hutch-v1"
+    common = "zeptaz-hutch-v2"
     protocols = [part.strip() for part in header.split(",")]
     grant = next((item.removeprefix("hutch-grant.") for item in protocols if item.startswith("hutch-grant.")), None)
     if common not in protocols or not grant:
         return None
     return common, grant
+
+
+def _spoken_text(value: str) -> str:
+    """Normalize only differences that do not change the spoken assertion."""
+    return " ".join(unicodedata.normalize("NFC", value).casefold().split())
+
+
+@dataclass
+class _Reply:
+    response_id: str
+    speech_text: str
+    sensitive: bool
+    proposal: dict | None
+    end_session: bool
+    audio: list[bytes] = field(default_factory=list)
+    audio_bytes: int = 0
+    output_fragments: list[str] = field(default_factory=list)
+    sent_audio: bool = False
+    complete: bool = False
+    playback_complete: bool = False
+    eligible: bool = False
+    interrupted: bool = False
+
+
+def _parse_browser_control(raw: str) -> dict | None:
+    if len(raw.encode("utf-8")) > 4096:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    control_type = value.get("type")
+    fields = {
+        "playback_complete": {"type", "response_id"},
+        "proposal_presented": {"type", "response_id", "proposal_id", "proposal_hash"},
+    }
+    if control_type not in fields or set(value) != fields[control_type]:
+        return None
+    if any(not isinstance(value[key], str) or not value[key] or len(value[key]) > 128
+           for key in fields[control_type] - {"type"}):
+        return None
+    return value
 
 
 async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: str,
@@ -163,33 +209,58 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
     latest_user_turn = ""
     pending_tool_calls: list = []
     language = "en"
-    allow_model_audio = False
-    proposal_audio_complete = False
-    proposal_acknowledged = False
-    proposal_audio_expected = False
-    latest_response_id: str | None = None
-    resolve_end_requested = False
+    reply: _Reply | None = None
     end_deadline: float | None = None
-    ended_reason: str | None = None
     audio_bytes = 0
+    sensitive_audio_limit = 30 * 24000 * 2
+
+    async def end_call():
+        await ws.send_json({"type": "ended", "reason": "resolve_requested"})
+        try:
+            await ws.close(code=1000, reason="resolve_requested")
+        except Exception:
+            pass
+        return "ended"
+
+    def revoke_reply(*, clear_presentation: bool = True):
+        nonlocal reply, end_deadline
+        if reply:
+            reply.interrupted = True
+            reply.eligible = False
+            reply.audio.clear()
+        if clear_presentation:
+            adapter.presented_proposal = None
+        end_deadline = None
 
     async def receive_audio():
-        nonlocal audio_bytes, proposal_audio_complete, proposal_acknowledged
+        nonlocal audio_bytes
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
                 return "disconnected"
             data = message.get("bytes")
-            if message.get("text"):
-                try:
-                    control = json.loads(message["text"])
-                except (ValueError, TypeError):
-                    control = {}
-                if control.get("type") == "proposal_presented":
-                    accepted = (proposal_audio_complete and not proposal_acknowledged and
-                        adapter.mark_proposal_presented(str(control.get("proposal_id", "")), str(control.get("proposal_hash", ""))))
-                    proposal_acknowledged = accepted or proposal_acknowledged
-                    await ws.send_json({"type": "proposal_ack", "accepted": accepted})
+            if message.get("text") is not None:
+                control = _parse_browser_control(message["text"])
+                if control is None:
+                    await ws.send_json({"type": "error", "code": "invalid_browser_control"})
+                    continue
+                current = reply
+                matching = bool(current and control["response_id"] == current.response_id and not current.interrupted)
+                if control["type"] == "playback_complete":
+                    accepted = bool(matching and current.complete and current.sent_audio and not current.playback_complete)
+                    if accepted:
+                        current.playback_complete = True
+                    await ws.send_json({"type": "playback_ack", "response_id": control["response_id"], "accepted": accepted})
+                    if accepted and current.end_session:
+                        return await end_call()
+                else:
+                    accepted = bool(matching and current.proposal and current.eligible and current.playback_complete and
+                        current.proposal.get("id") == control["proposal_id"] and
+                        current.proposal.get("proposal_hash") == control["proposal_hash"] and
+                        adapter.mark_proposal_presented(control["proposal_id"], control["proposal_hash"]))
+                    if accepted:
+                        current.eligible = False
+                    await ws.send_json({"type": "proposal_ack", "response_id": control["response_id"], "accepted": accepted})
                 continue
             if data is None:
                 continue
@@ -207,13 +278,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             await session.send_realtime_input(audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000"))
 
     async def receive_model():
-        nonlocal language, latest_user_turn, allow_model_audio, proposal_audio_complete
-        nonlocal proposal_acknowledged, proposal_audio_expected, latest_response_id, resolve_end_requested, end_deadline, ended_reason
+        nonlocal language, latest_user_turn, reply, end_deadline
 
         async def process_tool_calls(calls):
-            nonlocal latest_user_turn, allow_model_audio, proposal_audio_expected
-            nonlocal proposal_audio_complete, proposal_acknowledged, latest_response_id
-            nonlocal resolve_end_requested, end_deadline
+            nonlocal latest_user_turn, reply, end_deadline
             for call in calls:
                 if call.name != VOICE_TOOLS[0]["name"] or not latest_user_turn:
                     response = {"error": "no_finalized_caller_turn"}
@@ -222,21 +290,44 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     latest_user_turn = ""
                     response = await tools.execute(call.name, transcript=final_text, language=language)
                     if not response.get("error"):
-                        latest_response_id = response.get("response_id")
-                        proposal_audio_expected = bool(response.get("proposal"))
-                        proposal_audio_complete = False
-                        proposal_acknowledged = False
-                        resolve_end_requested = bool(response.get("end_session", False))
-                        if resolve_end_requested:
+                        revoke_reply(clear_presentation=False)
+                        reply = _Reply(
+                            response_id=str(response["response_id"]),
+                            speech_text=str(response.get("speech_text") or response.get("reply_text") or ""),
+                            sensitive=bool(response.get("proposal") or response.get("operation_status")),
+                            proposal=response.get("proposal"),
+                            end_session=bool(response.get("end_session", False)),
+                        )
+                        if reply.end_session:
                             end_deadline = time.monotonic() + end_session_timeout_seconds
                         await ws.send_json({
-                            "type": "resolve_result", "response_id": latest_response_id,
+                            "type": "resolve_result", "response_id": reply.response_id,
                             "case_id": response.get("case_id"), "reply_text": response.get("reply_text"),
+                            "speech_text": reply.speech_text, "sensitive_audio": reply.sensitive,
                             "pending_question": response.get("pending_question"), "proposal": response.get("proposal"),
-                            "operation_status": response.get("operation_status"), "end_session": resolve_end_requested,
+                            "operation_status": response.get("operation_status"), "end_session": reply.end_session,
                         })
                 await session.send_tool_response(function_responses=[types.FunctionResponse(id=call.id, name=call.name, response={"output": response})])
-                allow_model_audio = True
+
+        async def finish_reply(current: _Reply):
+            if current.sensitive:
+                spoken = "".join(current.output_fragments)
+                valid = bool(0 < current.audio_bytes <= sensitive_audio_limit and spoken and
+                             _spoken_text(spoken) == _spoken_text(current.speech_text))
+                if valid:
+                    await ws.send_json({"type": "audio_start", "response_id": current.response_id})
+                    for frame in current.audio:
+                        await ws.send_bytes(frame)
+                    current.sent_audio = True
+                    current.eligible = bool(current.proposal)
+                    await ws.send_json({"type": "audio_end", "response_id": current.response_id})
+                else:
+                    await ws.send_json({"type": "audio_fallback", "response_id": current.response_id,
+                                        "text": current.speech_text, "reason": "speech_verification_failed"})
+                current.audio.clear()
+            elif current.sent_audio:
+                await ws.send_json({"type": "audio_end", "response_id": current.response_id})
+            current.complete = True
 
         while True:
             saw_event = False
@@ -250,22 +341,15 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 except StopAsyncIteration:
                     break
                 except asyncio.TimeoutError:
-                    ended_reason = "resolve_requested"
-                    await ws.send_json({"type": "ended", "reason": ended_reason})
-                    try:
-                        await ws.close(code=1000, reason=ended_reason)
-                    except Exception:
-                        pass
-                    return "ended"
+                    return await end_call()
                 saw_event = True
                 content = getattr(event, "server_content", None)
                 was_interrupted = bool(content and getattr(content, "interrupted", False))
                 if was_interrupted:
-                    proposal_audio_complete = False
-                    proposal_acknowledged = False
-                    proposal_audio_expected = False
-                    adapter.presented_proposal = None
-                    await ws.send_json({"type": "interrupted", "response_id": latest_response_id})
+                    interrupted_id = reply.response_id if reply else None
+                    revoke_reply()
+                    pending_tool_calls.clear()
+                    await ws.send_json({"type": "interrupted", "response_id": interrupted_id})
                 transcript = getattr(content, "input_transcription", None) if content else None
                 if transcript and getattr(transcript, "text", None):
                     input_fragments.append(transcript.text)
@@ -273,38 +357,43 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     if input_fragments:
                         latest_user_turn = " ".join(part.strip() for part in input_fragments if part.strip()).strip()
                         input_fragments.clear()
-                        allow_model_audio = False
-                        proposal_audio_complete = False
-                        proposal_acknowledged = False
+                        revoke_reply(clear_presentation=False)
                         if latest_user_turn:
                             decision = detect_language(latest_user_turn)
                             language = decision.language or language
                             await ws.send_json({"type": "transcript", "speaker": "user", "text": latest_user_turn, "final": True})
                 output_transcript = getattr(content, "output_transcription", None) if content else None
-                if allow_model_audio and output_transcript and getattr(output_transcript, "text", None):
-                    await ws.send_json({"type": "transcript", "speaker": "assistant", "text": output_transcript.text, "final": bool(getattr(content, "turn_complete", False))})
-                if content:
+                current = reply if reply and not reply.interrupted and not reply.complete else None
+                if current and output_transcript and getattr(output_transcript, "text", None):
+                    current.output_fragments.append(output_transcript.text)
+                    if not current.sensitive:
+                        await ws.send_json({"type": "transcript", "speaker": "assistant", "response_id": current.response_id,
+                                            "text": output_transcript.text, "final": bool(getattr(content, "turn_complete", False))})
+                if current and content:
                     for part in (getattr(getattr(content, "model_turn", None), "parts", None) or []):
                         inline = getattr(part, "inline_data", None)
-                        if allow_model_audio and inline and getattr(inline, "data", None):
-                            await ws.send_bytes(inline.data)
-                    if getattr(content, "turn_complete", False) and proposal_audio_expected and not was_interrupted:
-                        proposal_audio_complete = True
-                        proposal_audio_expected = False
+                        if inline and getattr(inline, "data", None):
+                            frame = bytes(inline.data)
+                            if current.sensitive:
+                                current.audio_bytes += len(frame)
+                                if current.audio_bytes > sensitive_audio_limit:
+                                    current.audio.clear()
+                                    current.audio_bytes = sensitive_audio_limit + 1
+                                elif current.audio_bytes <= sensitive_audio_limit:
+                                    current.audio.append(frame)
+                            else:
+                                if not current.sent_audio:
+                                    await ws.send_json({"type": "audio_start", "response_id": current.response_id})
+                                await ws.send_bytes(frame)
+                                current.sent_audio = True
+                    if getattr(content, "turn_complete", False) and not was_interrupted:
+                        await finish_reply(current)
                 tool_call = getattr(event, "tool_call", None)
                 calls = getattr(tool_call, "function_calls", None) or []
                 pending_tool_calls.extend(calls)
                 if latest_user_turn and pending_tool_calls:
                     ready_calls, pending_tool_calls[:] = pending_tool_calls[:], []
                     await process_tool_calls(ready_calls)
-                if content and getattr(content, "turn_complete", False) and resolve_end_requested:
-                    ended_reason = "resolve_requested"
-                    await ws.send_json({"type": "ended", "reason": ended_reason})
-                    try:
-                        await ws.close(code=1000, reason=ended_reason)
-                    except Exception:
-                        pass
-                    return "ended"
                 if getattr(event, "go_away", None):
                     await ws.send_json({"type": "error", "code": "voice_session_ending", "message": "Continue by text if this call disconnects."})
             if not saw_event:
@@ -324,6 +413,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
         for task in done:
             result = task.result()
             if task is audio_task and result == "audio_limit":
+                return result
+            if task is audio_task and result == "ended":
                 return result
             if task is model_task and result == "ended":
                 return result
@@ -351,14 +442,14 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
     origin = (ws.headers.get("origin") or "").rstrip("/")
     offered = _grant_from_protocol(ws.headers.get("sec-websocket-protocol", ""))
     if not offered:
-        await ws.close(code=1008, reason="grant_required")
+        await ws.close(code=1008, reason="zeptaz_hutch_v2_required")
         return
     _, token = offered
     binding = app.state.store.consume_grant(token, session_id=session_id, origin=origin)
     if not binding:
         await ws.close(code=1008, reason="grant_invalid_or_used")
         return
-    await ws.accept(subprotocol="zeptaz-hutch-v1")
+    await ws.accept(subprotocol="zeptaz-hutch-v2")
     resolve = app.state.resolve
     session_started = time.monotonic()
     runtime_error: str | None = None

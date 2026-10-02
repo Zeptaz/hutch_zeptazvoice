@@ -20,6 +20,7 @@ class HutchAdapter:
         self.pending_proposal: dict | None = None
         self.presented_proposal: dict | None = None
         self.latest_case_id: str | None = None
+        self.pending_turn: VoiceTurnRequest | None = None
 
     def mark_proposal_presented(self, proposal_id: str, proposal_hash: str) -> bool:
         if not self.pending_proposal:
@@ -33,16 +34,30 @@ class HutchAdapter:
                                  transcript: str, language: str) -> VoiceTurnResponse:
         if not transcript.strip() or len(transcript) > 4000:
             raise ValueError("final transcript is empty or exceeds 4000 characters")
-        proposal = self.presented_proposal
-        self.presented_proposal = None
-        request = VoiceTurnRequest(
-            binding_id=binding_id, voice_session_id=voice_session_id,
-            event_id=str(uuid4()), turn_id=str(uuid4()), transcript=transcript.strip(),
-            language=language if language in {"en", "si", "ta"} else "en", is_final=True,
-            presented_proposal_id=proposal.get("id") if proposal else None,
-            presented_proposal_hash=proposal.get("proposal_hash") if proposal else None,
-        )
-        response = await self.client.send_turn(request)
+        normalized_language = language if language in {"en", "si", "ta"} else "en"
+        if self.pending_turn is not None:
+            request = self.pending_turn
+            if (request.transcript != transcript.strip() or request.language != normalized_language
+                    or request.binding_id != binding_id or request.voice_session_id != voice_session_id):
+                raise ResolveClientError("resolve_turn_pending", retryable=True)
+        else:
+            proposal = self.presented_proposal
+            self.presented_proposal = None
+            request = VoiceTurnRequest(
+                binding_id=binding_id, voice_session_id=voice_session_id,
+                event_id=str(uuid4()), turn_id=str(uuid4()), transcript=transcript.strip(),
+                language=normalized_language, is_final=True,
+                presented_proposal_id=proposal.get("id") if proposal else None,
+                presented_proposal_hash=proposal.get("proposal_hash") if proposal else None,
+            )
+            self.pending_turn = request
+        try:
+            response = await self.client.send_turn(request)
+        except ResolveClientError as exc:
+            if not exc.retryable:
+                self.pending_turn = None
+            raise
+        self.pending_turn = None
         self.pending_proposal = response.proposal.model_dump() if response.proposal else None
         self.latest_case_id = response.case_id or self.latest_case_id
         return response

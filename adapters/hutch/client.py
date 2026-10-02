@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from uuid import uuid4
 
 import httpx
@@ -40,11 +41,15 @@ class HutchResolveClient:
         body = canonical_json(turn.model_dump())
         event_id = turn.event_id
         url = f"{self.base_url}/integrations/voice/turns"
+        deadline = time.monotonic() + 18.0
         for attempt in range(2):
             headers = signed_headers(self.secret, event_id, body)
             try:
-                response = await self._client.post(url, content=body, headers=headers)
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                response = await asyncio.wait_for(
+                    self._client.post(url, content=body, headers=headers),
+                    timeout=max(0.01, deadline - time.monotonic()),
+                )
+            except (asyncio.TimeoutError, httpx.TimeoutException, httpx.NetworkError) as exc:
                 if attempt == 0:
                     await asyncio.sleep(0.15)
                     continue
@@ -57,6 +62,16 @@ class HutchResolveClient:
             if response.status_code in (401, 403):
                 raise ResolveClientError("resolve_auth_failed")
             if response.status_code == 409:
+                try:
+                    error = response.json().get("error", {})
+                except (ValueError, TypeError, AttributeError):
+                    error = {}
+                code = error.get("code") if isinstance(error, dict) else None
+                if code in {"TURN_IN_PROGRESS", "CONVERSATION_BUSY"} and error.get("retryable") is True:
+                    if attempt == 0:
+                        await asyncio.sleep(0.15)
+                        continue
+                    raise ResolveClientError("resolve_turn_pending", retryable=True)
                 raise ResolveClientError("resolve_event_conflict")
             if response.status_code >= 400:
                 raise ResolveClientError("resolve_rejected")
