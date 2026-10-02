@@ -11,6 +11,7 @@ Architecture remains external Zeptaz Voice Core -> Hutch Adapter -> Resolve. Res
 - [x] External Voice core and Hutch adapter remain on `adapter_buildation`; the complete local suite passed: 34 tests.
 - [x] Fake-runtime regressions cover fragmented finalized input, multiple model turns, interruption, sensitive audio grounding, response-scoped playback/proposal acknowledgements, malformed controls, bounded end-session and provider/task cleanup.
 - [x] Adapter retains event/turn IDs for retryable pending callbacks and bounds retries to an 18-second total budget.
+- [x] Commit `3f33b03` was pushed and remotely confirmed on `adapter_buildation`; Resolve counterpart `a92bea5` was pushed on `ResolveDev` (with follow-up `02ce2f6`).
 - [ ] Jayith must implement browser protocol `zeptaz-hutch-v2`, drain audio before `playback_complete`, then send `proposal_presented` only after accepted playback acknowledgement; discard queued audio on interruption.
 - [ ] Qualify a real browser/microphone/Gemini session through Tevin's mounted Resolve controller, including confirmation, decline and text continuation. No live qualification claim is made from fake tests.
 
