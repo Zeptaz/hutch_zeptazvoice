@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -29,13 +29,31 @@ class VoiceTurnRequest(StrictModel):
     presented_proposal_hash: str | None = None
 
 
+class PackageTerms(StrictModel):
+    name: str = Field(strict=True, min_length=1, max_length=120)
+    price_minor: int = Field(strict=True, ge=0, le=9_007_199_254_740_991)
+    currency: Literal["LKR"]
+    data_bytes: int = Field(strict=True, gt=0, le=9_007_199_254_740_991)
+    validity_seconds: int = Field(strict=True, gt=0, le=9_007_199_254_740_991)
+    recurring: Literal[False]
+
+
 class Proposal(StrictModel):
     id: str
     proposal_hash: str
-    action_type: Literal["DEACTIVATE_VAS", "SEND_SETTINGS_INSTRUCTIONS", "CREATE_REVIEW_TICKET"]
+    action_type: Literal["DEACTIVATE_VAS", "SEND_SETTINGS_INSTRUCTIONS", "CREATE_REVIEW_TICKET", "ACTIVATE_PACKAGE"]
     target_label: str
     consequences: str
     expires_at: str
+    package_terms: PackageTerms | None = None
+
+    @model_validator(mode="after")
+    def validate_package_terms(self) -> "Proposal":
+        if self.action_type == "ACTIVATE_PACKAGE" and self.package_terms is None:
+            raise ValueError("ACTIVATE_PACKAGE proposals require package_terms")
+        if self.action_type != "ACTIVATE_PACKAGE" and self.package_terms is not None:
+            raise ValueError("package_terms are only valid for ACTIVATE_PACKAGE proposals")
+        return self
 
 
 class VoiceTurnResponse(StrictModel):
@@ -45,7 +63,7 @@ class VoiceTurnResponse(StrictModel):
     speech_text: str
     pending_question: str | None = None
     proposal: Proposal | None = None
-    operation_status: str | None = None
+    operation_status: Literal["PENDING", "RUNNING", "SUCCEEDED", "FAILED", "UNKNOWN", "REVIEW_REQUIRED"] | None = None
     end_session: bool = False
 
 

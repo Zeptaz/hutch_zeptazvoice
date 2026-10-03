@@ -30,10 +30,10 @@ Turn request:
 {"binding_id":"...","voice_session_id":"...","event_id":"...","turn_id":"...","transcript":"The data stopped working","language":"en","is_final":true,"presented_proposal_id":null,"presented_proposal_hash":null}
 ```
 
-Resolve response:
+Resolve response (contract v1.1.0; `package_terms` is nullable and required only when `proposal.action_type` is `ACTIVATE_PACKAGE`):
 
 ```json
-{"response_id":"...","case_id":"...","reply_text":"...","speech_text":"...","pending_question":null,"proposal":{"id":"...","proposal_hash":"...","action_type":"DEACTIVATE_VAS","target_label":"Synthetic video alerts","consequences":"Stops future renewal only","expires_at":"..."},"operation_status":null,"end_session":false}
+{"response_id":"...","case_id":"...","reply_text":"...","speech_text":"...","pending_question":null,"proposal":{"id":"...","proposal_hash":"...","action_type":"ACTIVATE_PACKAGE","target_label":"Synthetic 1 GB one-day add-on","consequences":"One MAIN debit of LKR 49.00; existing packages are retained; auto-renewal is off.","package_terms":{"name":"Synthetic 1 GB one-day add-on","price_minor":4900,"currency":"LKR","data_bytes":1000000000,"validity_seconds":86400,"recurring":false},"expires_at":"..."},"operation_status":null,"end_session":false}
 ```
 
 `proposal` and `case_id` may be null. `operation_status` reports an actual saved operation state, never intent. Resolve owns identity and account authorization, evidence, diagnosis, proposal eligibility, fresh confirmation, idempotent execution/readback, human review and Trust Receipt. The next final caller turn includes the most recently presented proposal ID and hash. Voice cannot call simulator/provider methods directly and does not expose arbitrary billing or account mutation tools.

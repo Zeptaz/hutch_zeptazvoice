@@ -16,3 +16,11 @@ Architecture remains external Zeptaz Voice Core -> Hutch Adapter -> Resolve. Res
 - [ ] Qualify a real browser/microphone/Gemini session through Tevin's mounted Resolve controller, including confirmation, decline and text continuation. No live qualification claim is made from fake tests.
 
 The prior 15-test baseline and ephemeral streaming failure are superseded by the committed regression suite. Keep credentials server-side and audio recording disabled. The HTTP Voice turn/event shapes remain strict and unchanged; the browser WebSocket protocol changed to v2 and requires a coordinated frontend update.
+
+## Package confirmation integration — 2026-10-03
+
+- [x] The Hutch adapter accepts `ACTIVATE_PACKAGE` proposals only with typed `package_terms` (`name`, `price_minor`, `currency`, `data_bytes`, `validity_seconds`, `recurring=false`) and rejects mismatched action/terms combinations.
+- [x] Voice system instructions require reciting those exact terms. Confirmation still requires the response-scoped acknowledged proposal and a fresh affirmative final transcript; tool/model output cannot authorize an action.
+- [x] Voice suite: 49 passed; `git diff --check` passed.
+- [x] Resolve v1.1 package counterpart is committed and pushed as `hutch_resolve/ResolveDev` commit `d5c881a`.
+- [ ] Disposable PostgreSQL now verifies migration/reset, concurrent same-offer confirmation, one debit/subscription/provider operation and Trust Receipt. Package-specific crash/lost-response and injected-provider-failure recovery still need qualification; the Resolve package feature flag remains false by default.
