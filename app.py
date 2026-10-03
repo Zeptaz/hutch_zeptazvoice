@@ -341,12 +341,14 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             nonlocal latest_user_turn, reply, pending_spoken_reply, forwarded_without_tool
             nonlocal snapshot_sent_early, original_turn_interrupted, end_deadline, speech_deadline
             for call in calls:
-                if call.name == VOICE_TOOLS[0]["name"] and pending_spoken_reply and forwarded_without_tool:
+                if (call.name == VOICE_TOOLS[0]["name"] and forwarded_without_tool and
+                        (pending_spoken_reply or (reply and not reply.complete))):
                     # A no-finished transcription reached Resolve before Gemini's tool call.
-                    # Answer that call with the same result, allowing the Live turn to resume.
+                    # This may arrive even after the old turn's interruption boundary.
+                    # Answer with the same result, never a second Resolve operation.
                     response = forwarded_without_tool
                     forwarded_without_tool = None
-                    if not snapshot_sent_early:
+                    if pending_spoken_reply and not snapshot_sent_early:
                         reply = pending_spoken_reply
                         pending_spoken_reply = None
                         original_turn_interrupted = False
@@ -396,13 +398,14 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     reply.speech_requested_at = time.monotonic()
 
         async def finish_reply(current: _Reply):
-            nonlocal speech_deadline, end_deadline
+            nonlocal speech_deadline, end_deadline, forwarded_without_tool
             if current.sent_audio:
                 await ws.send_json({"type": "audio_end", "response_id": current.response_id})
             else:
                 await ws.send_json({"type": "error", "code": "speech_unavailable",
                                     "message": "The reply is on screen. Continue by text or try speaking again."})
             current.complete = True
+            forwarded_without_tool = None
             speech_deadline = None
             if current.end_session and end_deadline is None:
                 # Let the browser drain the full PCM reply before a bounded
@@ -487,7 +490,6 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 if pending_spoken_reply and content and getattr(content, "turn_complete", False) and not calls:
                     reply = pending_spoken_reply
                     pending_spoken_reply = None
-                    forwarded_without_tool = None
                     if not snapshot_sent_early or not original_turn_interrupted:
                         # No explicit interruption boundary: the early request may
                         # already have spoken, but that audio was unproven and dropped.
@@ -531,7 +533,9 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 if calls:
                     logger.info("Voice model tool calls session=%s count=%s", session_id, len(calls))
                 pending_tool_calls.extend(calls)
-                if pending_tool_calls and (latest_user_turn or pending_spoken_reply or (reply and reply.complete)):
+                if pending_tool_calls and (latest_user_turn or pending_spoken_reply or
+                                           (forwarded_without_tool and reply and not reply.complete) or
+                                           (reply and reply.complete)):
                     ready_calls, pending_tool_calls[:] = pending_tool_calls[:], []
                     await process_tool_calls(ready_calls)
                 if getattr(event, "go_away", None):

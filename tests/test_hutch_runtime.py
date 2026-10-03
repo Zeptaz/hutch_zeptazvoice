@@ -324,6 +324,33 @@ async def test_late_tool_and_original_turn_completion_in_same_event_do_not_reque
 
 
 @pytest.mark.asyncio
+async def test_tool_call_after_interruption_boundary_reuses_resolve_result_and_speaks():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="My data stopped working", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
+    await asyncio.sleep(0.01)
+    assert len(session.client_contents) == 1
+    await session.cycles.put([event(tool_call=[call()])])
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert len(session.tool_responses) == 1
+    assert len(tools.transcripts) == 1
+    assert session.tool_responses[0].response["output"]["response_id"] == "response-1"
+    assert not any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing)
+    await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
+    await ws.wait_for(lambda: b"grounded pcm" in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("code") == "speech_unavailable"
+                   for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
 async def test_early_snapshot_interrupt_drops_old_audio_then_streams_grounded_reply():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
