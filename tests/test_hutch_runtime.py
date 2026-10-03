@@ -290,7 +290,10 @@ async def test_no_finished_transcript_then_model_tool_reuses_one_resolve_result(
     assert len(tools.transcripts) == 1
     assert session.tool_responses[0].response["output"]["response_id"] == "response-1"
     assert session.tool_responses[0].response["session_memory_snapshot"]["latest_resolve_result"]["reply_text"] == "Grounded support response"
-    assert session.client_contents == []
+    assert len(session.client_contents) == 1  # early snapshot request
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
+    await asyncio.sleep(0.01)
+    assert not any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing)
     await session.cycles.put([event(audio=b"live pcm", complete=True)])
     await ws.wait_for(lambda: b"live pcm" in ws.outgoing)
     assert not any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing)
@@ -311,10 +314,32 @@ async def test_late_tool_and_original_turn_completion_in_same_event_do_not_reque
         await asyncio.sleep(0.01)
     assert len(tools.transcripts) == 1
     assert len(session.tool_responses) == 1
-    assert session.client_contents == []
+    assert len(session.client_contents) == 1  # early snapshot request
     assert b"ungrounded" not in ws.outgoing
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
     await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
     await ws.wait_for(lambda: b"grounded pcm" in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_early_snapshot_interrupt_drops_old_audio_then_streams_grounded_reply():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    assert len(session.client_contents) == 1
+    await session.cycles.put([event(audio=b"old ungrounded"), event(interrupted=True),
+                              event(complete=True, audio=b"old tail")])
+    await asyncio.sleep(0.02)
+    assert b"old ungrounded" not in ws.outgoing
+    assert b"old tail" not in ws.outgoing
+    assert not any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing)
+    assert len(session.client_contents) == 1
+    await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
+    await ws.wait_for(lambda: b"grounded pcm" in ws.outgoing)
+    assert len(tools.transcripts) == 1
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 
@@ -330,12 +355,13 @@ async def test_live_final_transcript_without_finished_uses_session_memory_and_st
         "transcript", "resolve_result",
     ]
     assert not any(isinstance(item, bytes) for item in ws.outgoing)
-    # Discard the original ungrounded model turn, then give Live the Resolve snapshot.
+    # If Gemini omits the interrupted boundary, drop the ambiguous turn and retry safely.
     await session.cycles.put([event(complete=True, audio=b"ungrounded", output="Unverified words")])
     for _ in range(50):
-        if session.client_contents:
+        if len(session.client_contents) >= 2:
             break
         await asyncio.sleep(0.01)
+    assert len(session.client_contents) == 2
     assert session.client_contents[0][1] is True
     assert 'hutch_resolve_session_memory_snapshot' in session.client_contents[0][0].parts[0].text
     assert "Grounded support response" in session.client_contents[0][0].parts[0].text

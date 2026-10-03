@@ -54,6 +54,8 @@ Partial transcripts are displayed only. The Gemini function declaration exposes 
 
 ## Failure / privacy
 
+The no-tool speech path now sends the Resolve session memory snapshot immediately after `resolve_result`, interrupting Gemini's original ungrounded generation. Voice discards all output from that old turn through Gemini's `interrupted` and `turn_complete` boundary, then streams the grounded reply. A late tool call receives the same saved Resolve result and remains pending through that boundary. If Gemini does not provide an explicit interruption boundary, Voice discards the ambiguous turn and requests the snapshot again after completion; this safety fallback can be slower. Per-response logs record elapsed milliseconds from Resolve result and snapshot request to first grounded PCM, with no audio or transcript contents. The browser wire contract and tap-only proposal consent are unchanged.
+
 Resolve unavailable or invalid response: say support is temporarily unavailable and direct the user to the independent Resolve text channel. Disconnect sends a best-effort lifecycle event; case and operation state remain in Resolve. Voice logs IDs, error class and model/profile only; it does not log audio, transcripts, secrets or raw provider payloads. Gemini Live keys and HMAC secrets are environment-only. No credentials from the inspected source repo are copied.
 
 ## Proposed vs existing
