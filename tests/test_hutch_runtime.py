@@ -88,12 +88,17 @@ class FakeAdapter:
 
 
 class FakeTools:
-    def __init__(self, *, end_session=False):
+    def __init__(self, *, end_session=False, failure=None):
         self.transcripts = []
         self.end_session = end_session
+        self.failure = failure
 
     async def execute(self, name, *, transcript, language):
         self.transcripts.append((transcript, language))
+        if isinstance(self.failure, BaseException):
+            raise self.failure
+        if self.failure:
+            return {"error": self.failure}
         return {
             "response_id": f"response-{len(self.transcripts)}", "case_id": "case-1",
             "reply_text": "Grounded support response", "speech_text": "Grounded support response",
@@ -351,6 +356,45 @@ async def test_sensitive_speech_mismatch_discards_audio_and_proposal_eligibility
     await ws.incoming.put({"text": '{"type":"proposal_presented","response_id":"response-1","proposal_id":"proposal-1","proposal_hash":"hash-1"}'})
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "proposal_ack" for item in ws.outgoing))
     assert ws.outgoing[-1]["accepted"] is False
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_resolve_reply_mismatch_cannot_play_unverified_financial_audio():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="What happened to my bill?", complete=True), event(tool_call=[call()])])
+    await ws.wait_for(lambda: any(item.get("type") == "resolve_result" for item in ws.outgoing if isinstance(item, dict)))
+    # The invented claim differs from Resolve's canonical text and must never reach the caller.
+    await session.cycles.put([event(complete=True, audio=b"false refund audio", output="Your LKR 8,000 refund was approved.")])
+    await ws.wait_for(lambda: any(item.get("type") == "audio_fallback" for item in ws.outgoing if isinstance(item, dict)))
+    assert b"false refund audio" not in ws.outgoing
+    assert not any(isinstance(item, dict) and item.get("type") == "transcript" and item.get("speaker") == "assistant" for item in ws.outgoing)
+    fallback = next(item for item in ws.outgoing if isinstance(item, dict) and item.get("type") == "audio_fallback")
+    assert fallback["text"] == "Grounded support response"
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["resolve_unavailable", RuntimeError("private detail")])
+async def test_resolve_tool_failure_emits_typed_error_and_never_forwards_model_claim(failure):
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools(failure=failure)
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my refund", complete=True), event(tool_call=[call()])])
+    await ws.wait_for(lambda: any(item.get("type") == "error" and item.get("code") == "resolve_tool_failed"
+                                  for item in ws.outgoing if isinstance(item, dict)))
+    # A model response following the tool error has no active Resolve reply and is discarded.
+    await session.cycles.put([event(complete=True, audio=b"fabricated claim", output="Your refund was approved.")])
+    await asyncio.sleep(0.02)
+    errors = [item for item in ws.outgoing if isinstance(item, dict) and item.get("type") == "error"]
+    assert errors == [{
+        "type": "error", "code": "resolve_tool_failed",
+        "message": "I couldn’t complete that request. Please continue by text or try again.",
+    }]
+    assert b"fabricated claim" not in ws.outgoing
+    assert not any(isinstance(item, dict) and item.get("type") in {"resolve_result", "audio_fallback"} for item in ws.outgoing)
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 

@@ -288,13 +288,19 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 else:
                     final_text = latest_user_turn
                     latest_user_turn = ""
-                    response = await tools.execute(call.name, transcript=final_text, language=language)
+                    try:
+                        response = await tools.execute(call.name, transcript=final_text, language=language)
+                    except Exception as exc:
+                        logger.warning("Resolve voice tool failed (%s)", type(exc).__name__)
+                        response = {"error": "resolve_tool_failed"}
                     if not response.get("error"):
                         revoke_reply(clear_presentation=False)
                         reply = _Reply(
                             response_id=str(response["response_id"]),
                             speech_text=str(response.get("speech_text") or response.get("reply_text") or ""),
-                            sensitive=bool(response.get("proposal") or response.get("operation_status")),
+                            # Every spoken answer is model-generated audio. Buffer and verify it
+                            # against Resolve's canonical text before exposing any audio or transcript.
+                            sensitive=True,
                             proposal=response.get("proposal"),
                             end_session=bool(response.get("end_session", False)),
                         )
@@ -306,6 +312,13 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             "speech_text": reply.speech_text, "sensitive_audio": reply.sensitive,
                             "pending_question": response.get("pending_question"), "proposal": response.get("proposal"),
                             "operation_status": response.get("operation_status"), "end_session": reply.end_session,
+                        })
+                    else:
+                        # Do not ask the model to explain an error in its own words: that can
+                        # turn a failed lookup/action into a fabricated outcome for the caller.
+                        await ws.send_json({
+                            "type": "error", "code": "resolve_tool_failed",
+                            "message": "I couldn’t complete that request. Please continue by text or try again.",
                         })
                 await session.send_tool_response(function_responses=[types.FunctionResponse(id=call.id, name=call.name, response={"output": response})])
 
@@ -366,26 +379,17 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 current = reply if reply and not reply.interrupted and not reply.complete else None
                 if current and output_transcript and getattr(output_transcript, "text", None):
                     current.output_fragments.append(output_transcript.text)
-                    if not current.sensitive:
-                        await ws.send_json({"type": "transcript", "speaker": "assistant", "response_id": current.response_id,
-                                            "text": output_transcript.text, "final": bool(getattr(content, "turn_complete", False))})
                 if current and content:
                     for part in (getattr(getattr(content, "model_turn", None), "parts", None) or []):
                         inline = getattr(part, "inline_data", None)
                         if inline and getattr(inline, "data", None):
                             frame = bytes(inline.data)
-                            if current.sensitive:
-                                current.audio_bytes += len(frame)
-                                if current.audio_bytes > sensitive_audio_limit:
-                                    current.audio.clear()
-                                    current.audio_bytes = sensitive_audio_limit + 1
-                                elif current.audio_bytes <= sensitive_audio_limit:
-                                    current.audio.append(frame)
-                            else:
-                                if not current.sent_audio:
-                                    await ws.send_json({"type": "audio_start", "response_id": current.response_id})
-                                await ws.send_bytes(frame)
-                                current.sent_audio = True
+                            current.audio_bytes += len(frame)
+                            if current.audio_bytes > sensitive_audio_limit:
+                                current.audio.clear()
+                                current.audio_bytes = sensitive_audio_limit + 1
+                            elif current.audio_bytes <= sensitive_audio_limit:
+                                current.audio.append(frame)
                     if getattr(content, "turn_complete", False) and not was_interrupted:
                         await finish_reply(current)
                 tool_call = getattr(event, "tool_call", None)

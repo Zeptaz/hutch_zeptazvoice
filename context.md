@@ -17,6 +17,13 @@ Architecture remains external Zeptaz Voice Core -> Hutch Adapter -> Resolve. Res
 
 The prior 15-test baseline and ephemeral streaming failure are superseded by the committed regression suite. Keep credentials server-side and audio recording disabled. The HTTP Voice turn/event shapes remain strict and unchanged; the browser WebSocket protocol changed to v2 and requires a coordinated frontend update.
 
+## Audit repair: spoken reply grounding and adapter failures — 2026-10-03
+
+- [x] The Hutch runtime now buffers model-generated assistant audio and transcript until it exactly matches Resolve's canonical `speech_text`; mismatch falls back to the canonical text and never plays the unverified model audio.
+- [x] Resolve tool exceptions and error responses now produce a sanitized typed `error` event and no caller-facing model reply. No transcript, customer input, or exception text is logged or returned.
+- [x] Verification on `adapter_buildation`: focused runtime tests **20 passed**, full Voice suite **52 passed**, `git diff --check` passed.
+- [ ] Real microphone/Resolve/model qualification remains outstanding. Synchronize this audit repair with `hutch_resolve/context.md` and `docs/plans/harry.md` after the Resolve phase is committed.
+
 ## Package confirmation integration — 2026-10-03
 
 - [x] The Hutch adapter accepts `ACTIVATE_PACKAGE` proposals only with typed `package_terms` (`name`, `price_minor`, `currency`, `data_bytes`, `validity_seconds`, `recurring=false`) and rejects mismatched action/terms combinations.
