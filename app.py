@@ -165,6 +165,7 @@ class _Reply:
     memory_snapshot: dict
     resolve_result_at: float
     speech_requested_at: float | None = None
+    speech_retry_count: int = 0
     audio_bytes: int = 0
     sent_audio: bool = False
     complete: bool = False
@@ -204,6 +205,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                                   session_id: str, max_audio_bytes: int,
                                   max_session_seconds: int, end_session_timeout_seconds: float = 5.0,
                                   speech_timeout_seconds: float = 45.0,
+                                  first_audio_timeout_seconds: float = 10.0,
                                   protocol_version: int = 2):
     """Supervise both sides of the live call until disconnect, failure, or Resolve end."""
     input_fragments: list[str] = []
@@ -327,6 +329,22 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             current.speech_requested_at = time.monotonic()
             logger.info("Voice response speech requested session=%s reply_chars=%s", session_id,
                         len(str(current.memory_snapshot["latest_resolve_result"]["reply_text"])))
+
+        async def retry_snapshot_speech(current: _Reply) -> bool:
+            # One speech-only retry reuses the saved Resolve result. A second
+            # investigation would risk duplicate effects and cannot fix PCM.
+            if (current.sent_audio or current.interrupted or current.complete or
+                    current.speech_retry_count or speech_deadline is None or
+                    time.monotonic() >= speech_deadline):
+                return False
+            current.speech_retry_count = 1
+            try:
+                await request_snapshot_speech(current)
+            except Exception as exc:
+                logger.warning("Voice speech retry failed session=%s error=%s", session_id, type(exc).__name__)
+                return False
+            logger.info("Voice speech retry requested session=%s response=%s", session_id, current.response_id)
+            return True
 
         async def forward_without_model_tool(final_text: str, turn_language: str):
             nonlocal latest_user_turn, pending_spoken_reply, forwarded_without_tool
@@ -463,7 +481,13 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             control_task: asyncio.Task | None = None
             while True:
                 try:
-                    deadlines = [value for value in (end_deadline, speech_deadline, tool_grace_deadline)
+                    current_first_audio_deadline = (
+                        reply.speech_requested_at + min(first_audio_timeout_seconds, speech_timeout_seconds)
+                        if reply and not reply.sent_audio and not reply.complete and
+                        reply.speech_requested_at is not None else None
+                    )
+                    deadlines = [value for value in (end_deadline, speech_deadline, tool_grace_deadline,
+                                                     current_first_audio_deadline)
                                  if value is not None]
                     if event_task is None:
                         event_task = own_task(iterator.__anext__())
@@ -538,6 +562,14 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             except Exception as exc:
                                 logger.warning("Voice snapshot request failed (%s)", type(exc).__name__)
                         continue
+                    if (current_first_audio_deadline is not None and
+                            time.monotonic() >= current_first_audio_deadline and
+                            speech_deadline is not None and time.monotonic() < speech_deadline and reply):
+                        if await retry_snapshot_speech(reply):
+                            continue
+                        await finish_reply(reply)
+                        saw_event = True
+                        break
                     if speech_deadline is not None and time.monotonic() >= speech_deadline:
                         waiting = pending_spoken_reply or (reply if reply and not reply.complete else None)
                         logger.info("Voice speech timeout session=%s pending=%s audio_bytes=%s",
@@ -665,6 +697,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             current.audio_bytes += len(frame)
                             await ws.send_bytes(frame)
                     if not current.complete and getattr(content, "turn_complete", False) and not was_interrupted:
+                        if not current.sent_audio and await retry_snapshot_speech(current):
+                            continue
                         await finish_reply(current)
                 if calls:
                     logger.info("Voice model tool calls session=%s count=%s", session_id, len(calls))

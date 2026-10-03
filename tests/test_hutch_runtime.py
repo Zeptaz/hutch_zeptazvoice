@@ -123,12 +123,13 @@ def fake_genai_types(monkeypatch):
 
 
 async def run(ws, session, tools, adapter, *, max_session_seconds=2, end_session_timeout_seconds=5,
-              speech_timeout_seconds=45, protocol_version=2):
+              speech_timeout_seconds=45, first_audio_timeout_seconds=10, protocol_version=2):
     return await app._run_hutch_live_session(
         ws=ws, session=session, tools=tools, adapter=adapter,
         binding_id="binding-1", session_id="voice-1", max_audio_bytes=100,
         max_session_seconds=max_session_seconds, end_session_timeout_seconds=end_session_timeout_seconds,
-        speech_timeout_seconds=speech_timeout_seconds, protocol_version=protocol_version,
+        speech_timeout_seconds=speech_timeout_seconds,
+        first_audio_timeout_seconds=first_audio_timeout_seconds, protocol_version=protocol_version,
     )
 
 
@@ -651,6 +652,10 @@ async def test_zero_audio_cannot_be_acknowledged_and_later_model_audio_is_droppe
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
     await session.cycles.put([event(complete=True, output="Grounded support response")])
+    await asyncio.sleep(0.02)
+    assert len(session.client_contents) == 1
+    assert len(tools.transcripts) == 1
+    await session.cycles.put([event(complete=True, output="Grounded support response")])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing))
     await ws.incoming.put({"text": '{"type":"playback_complete","response_id":"response-1"}'})
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "playback_ack" for item in ws.outgoing))
@@ -658,6 +663,42 @@ async def test_zero_audio_cannot_be_acknowledged_and_later_model_audio_is_droppe
     await session.cycles.put([event(complete=True, audio=b"unsolicited")])
     await asyncio.sleep(0.02)
     assert b"unsolicited" not in ws.outgoing
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_zero_audio_completion_retries_saved_resolve_speech_once_then_speaks():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", complete=True), event(tool_call=[call()])])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    await session.cycles.put([event(complete=True)])
+    await asyncio.sleep(0.02)
+    assert len(session.client_contents) == 1
+    assert not any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing)
+    await session.cycles.put([event(audio=b"recovered pcm0"), event(complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
+    assert b"recovered pcm0" in ws.outgoing
+    assert len(tools.transcripts) == 1
+    assert len(session.client_contents) == 1
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_first_pcm_watchdog_retries_once_then_reports_unavailable():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, speech_timeout_seconds=0.3,
+                                   first_audio_timeout_seconds=0.03))
+    await session.cycles.put([event(transcript="Check my balance", complete=True), event(tool_call=[call()])])
+    await asyncio.sleep(0.06)
+    assert len(session.client_contents) == 1
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("code") == "speech_unavailable"
+                                  for item in ws.outgoing), timeout=0.3)
+    assert len(session.client_contents) == 1
+    assert len(tools.transcripts) == 1
+    assert not any(isinstance(item, dict) and item.get("type") == "audio_start" for item in ws.outgoing)
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 
