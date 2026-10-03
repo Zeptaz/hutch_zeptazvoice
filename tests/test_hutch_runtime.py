@@ -327,20 +327,26 @@ async def test_late_tool_and_original_turn_completion_in_same_event_do_not_reque
 async def test_tool_call_after_interruption_boundary_reuses_resolve_result_and_speaks():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("response_id") == "response-1"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
+    await session.cycles.put([event(audio=b"first grounded pcm", complete=True)])
+    await ws.wait_for(lambda: b"first grounded pcm" in ws.outgoing)
     await session.cycles.put([event(transcript="My data stopped working", finished_missing=True)])
-    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("response_id") == "response-2"
                                   for item in ws.outgoing))
     await session.cycles.put([event(interrupted=True), event(complete=True)])
     await asyncio.sleep(0.01)
-    assert len(session.client_contents) == 1
+    assert len(session.client_contents) == 2
     await session.cycles.put([event(tool_call=[call()])])
     for _ in range(50):
         if session.tool_responses:
             break
         await asyncio.sleep(0.01)
     assert len(session.tool_responses) == 1
-    assert len(tools.transcripts) == 1
-    assert session.tool_responses[0].response["output"]["response_id"] == "response-1"
+    assert len(tools.transcripts) == 2
+    assert session.tool_responses[0].response["output"]["response_id"] == "response-2"
     assert not any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing)
     await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
     await ws.wait_for(lambda: b"grounded pcm" in ws.outgoing)
