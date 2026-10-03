@@ -6,9 +6,10 @@ import pytest
 import app
 
 
-def event(*, transcript=None, transcript_finished=None, complete=False, tool_call=None, interrupted=False, audio=None, output=None):
+def event(*, transcript=None, transcript_finished=None, finished_missing=False, complete=False, tool_call=None, interrupted=False, audio=None, output=None):
     content = NS(
-        input_transcription=NS(text=transcript, finished=bool(complete) if transcript_finished is None else transcript_finished) if transcript is not None else None,
+        input_transcription=(NS(text=transcript) if finished_missing else
+            NS(text=transcript, finished=bool(complete) if transcript_finished is None else transcript_finished)) if transcript is not None else None,
         output_transcription=NS(text=output) if output is not None else None,
         turn_complete=complete,
         interrupted=interrupted,
@@ -56,6 +57,7 @@ class FakeSession:
         self.cycles = asyncio.Queue()
         self.tool_responses = []
         self.audio_inputs = []
+        self.client_contents = []
         self.cancelled = False
 
     async def receive(self):
@@ -71,8 +73,11 @@ class FakeSession:
     async def send_tool_response(self, *, function_responses):
         self.tool_responses.extend(function_responses)
 
-    async def send_realtime_input(self, *, audio):
-        self.audio_inputs.append(audio)
+    async def send_realtime_input(self, *, audio=None, audio_stream_end=False):
+        self.audio_inputs.append(audio if audio is not None else {"audio_stream_end": audio_stream_end})
+
+    async def send_client_content(self, *, turns, turn_complete):
+        self.client_contents.append((turns, turn_complete))
 
 
 class FakeAdapter:
@@ -112,14 +117,18 @@ def fake_genai_types(monkeypatch):
     monkeypatch.setattr(app, "types", NS(
         Blob=lambda **kwargs: NS(**kwargs),
         FunctionResponse=lambda **kwargs: NS(**kwargs),
+        Content=lambda **kwargs: NS(**kwargs),
+        Part=lambda **kwargs: NS(**kwargs),
     ))
 
 
-async def run(ws, session, tools, adapter, *, max_session_seconds=2, end_session_timeout_seconds=5):
+async def run(ws, session, tools, adapter, *, max_session_seconds=2, end_session_timeout_seconds=5,
+              speech_timeout_seconds=45):
     return await app._run_hutch_live_session(
         ws=ws, session=session, tools=tools, adapter=adapter,
         binding_id="binding-1", session_id="voice-1", max_audio_bytes=100,
         max_session_seconds=max_session_seconds, end_session_timeout_seconds=end_session_timeout_seconds,
+        speech_timeout_seconds=speech_timeout_seconds,
     )
 
 
@@ -188,7 +197,8 @@ async def test_resolve_end_session_waits_for_final_grounded_output_then_closes()
 @pytest.mark.asyncio
 async def test_end_session_has_a_bound_when_provider_never_finishes_reply(monkeypatch):
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools(end_session=True)
-    task = asyncio.create_task(run(ws, session, tools, adapter, end_session_timeout_seconds=0.03))
+    task = asyncio.create_task(run(ws, session, tools, adapter, end_session_timeout_seconds=0.03,
+                                   speech_timeout_seconds=0.03))
     await session.cycles.put([event(transcript="Goodbye", complete=True), event(tool_call=[call()])])
     assert await task == "ended"
     assert ws.closed == (1000, "resolve_requested")
@@ -258,6 +268,53 @@ async def test_incomplete_transcription_is_never_sent_to_resolve():
     await session.cycles.put([event(transcript="Unfinalized words", transcript_finished=False, complete=True), event(tool_call=[call()])])
     await asyncio.sleep(0.02)
     assert tools.transcripts == []
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_live_final_transcript_without_finished_or_tool_uses_grounded_browser_speech():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    assert tools.transcripts == [("Check my balance", "en")]
+    assert [item["type"] for item in ws.outgoing if isinstance(item, dict)] == [
+        "transcript", "resolve_result",
+    ]
+    assert not any(isinstance(item, bytes) for item in ws.outgoing)
+    # Discard the original ungrounded model turn, then request exact speech.
+    await session.cycles.put([event(complete=True, audio=b"ungrounded", output="Unverified words")])
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    assert session.client_contents[0][1] is True
+    assert "Grounded support response" in session.client_contents[0][0].parts[0].text
+    assert b"ungrounded" not in ws.outgoing
+    await session.cycles.put([event(complete=True, audio=b"verified audio", output="Grounded support response")])
+    await ws.wait_for(lambda: b"verified audio" in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("type") == "audio_fallback" for item in ws.outgoing)
+    await session.cycles.put([event(tool_call=[call("late-model-tool")])])
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert len(tools.transcripts) == 1
+    assert session.tool_responses[0].response["output"] == {"error": "no_finalized_caller_turn"}
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_browser_end_of_speech_flushes_gemini_audio_once():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await ws.incoming.put({"bytes": b"\x01\x00" * 20})
+    await ws.incoming.put({"text": '{"type":"input_audio_end"}'})
+    await ws.incoming.put({"text": '{"type":"input_audio_end"}'})
+    await asyncio.sleep(0.02)
+    assert session.audio_inputs[1] == {"audio_stream_end": True}
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 

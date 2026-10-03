@@ -190,6 +190,7 @@ def _parse_browser_control(raw: str) -> dict | None:
         return None
     control_type = value.get("type")
     fields = {
+        "input_audio_end": {"type"},
         "playback_complete": {"type", "response_id"},
         "proposal_presented": {"type", "response_id", "proposal_id", "proposal_hash"},
     }
@@ -203,7 +204,8 @@ def _parse_browser_control(raw: str) -> dict | None:
 
 async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: str,
                                   session_id: str, max_audio_bytes: int,
-                                  max_session_seconds: int, end_session_timeout_seconds: float = 5.0):
+                                  max_session_seconds: int, end_session_timeout_seconds: float = 5.0,
+                                  speech_timeout_seconds: float = 45.0):
     """Supervise both sides of the live call until disconnect, failure, or Resolve end."""
     input_fragments: list[str] = []
     latest_user_turn = ""
@@ -234,6 +236,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
 
     async def receive_audio():
         nonlocal audio_bytes
+        audio_since_end = False
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
@@ -243,6 +246,12 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 control = _parse_browser_control(message["text"])
                 if control is None:
                     await ws.send_json({"type": "error", "code": "invalid_browser_control"})
+                    continue
+                if control["type"] == "input_audio_end":
+                    if audio_since_end:
+                        logger.info("Voice input segment ended session=%s bytes=%s", session_id, audio_bytes)
+                        await session.send_realtime_input(audio_stream_end=True)
+                        audio_since_end = False
                     continue
                 current = reply
                 matching = bool(current and control["response_id"] == current.response_id and not current.interrupted)
@@ -268,6 +277,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 await ws.send_json({"type": "error", "code": "invalid_audio_frame"})
                 continue
             audio_bytes += len(data)
+            audio_since_end = True
             if audio_bytes > max_audio_bytes:
                 await ws.send_json({"type": "error", "code": "audio_limit_reached", "message": "Continue by text."})
                 try:
@@ -279,9 +289,44 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
 
     async def receive_model():
         nonlocal language, latest_user_turn, reply, end_deadline
+        pending_spoken_reply: _Reply | None = None
+        speech_deadline: float | None = None
+
+        async def forward_without_model_tool():
+            nonlocal latest_user_turn, pending_spoken_reply, speech_deadline
+            final_text = latest_user_turn
+            latest_user_turn = ""
+            try:
+                response = await tools.execute(VOICE_TOOLS[0]["name"], transcript=final_text, language=language)
+            except Exception as exc:
+                logger.warning("Resolve voice tool failed (%s)", type(exc).__name__)
+                response = {"error": "resolve_tool_failed"}
+            if response.get("error"):
+                await ws.send_json({"type": "error", "code": "resolve_tool_failed",
+                                    "message": "I couldn't complete that request. Please continue by text or try again."})
+                return
+            revoke_reply(clear_presentation=False)
+            pending_spoken_reply = _Reply(
+                response_id=str(response["response_id"]),
+                speech_text=str(response.get("speech_text") or response.get("reply_text") or ""),
+                sensitive=True,
+                proposal=response.get("proposal"),
+                end_session=bool(response.get("end_session", False)),
+            )
+            speech_deadline = time.monotonic() + speech_timeout_seconds
+            await ws.send_json({
+                "type": "resolve_result", "response_id": pending_spoken_reply.response_id,
+                "case_id": response.get("case_id"), "reply_text": response.get("reply_text"),
+                "speech_text": pending_spoken_reply.speech_text, "sensitive_audio": True,
+                "pending_question": response.get("pending_question"), "proposal": response.get("proposal"),
+                "operation_status": response.get("operation_status"), "end_session": pending_spoken_reply.end_session,
+            })
+            # The original model turn is ungrounded. Wait for it to complete,
+            # then ask Gemini to speak only Resolve's answer. Its audio remains
+            # buffered until output transcription matches the exact answer.
 
         async def process_tool_calls(calls):
-            nonlocal latest_user_turn, reply, end_deadline
+            nonlocal latest_user_turn, reply, end_deadline, speech_deadline
             for call in calls:
                 if call.name != VOICE_TOOLS[0]["name"] or not latest_user_turn:
                     response = {"error": "no_finalized_caller_turn"}
@@ -304,8 +349,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             proposal=response.get("proposal"),
                             end_session=bool(response.get("end_session", False)),
                         )
-                        if reply.end_session:
-                            end_deadline = time.monotonic() + end_session_timeout_seconds
+                        speech_deadline = time.monotonic() + speech_timeout_seconds
                         await ws.send_json({
                             "type": "resolve_result", "response_id": reply.response_id,
                             "case_id": response.get("case_id"), "reply_text": response.get("reply_text"),
@@ -323,10 +367,13 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 await session.send_tool_response(function_responses=[types.FunctionResponse(id=call.id, name=call.name, response={"output": response})])
 
         async def finish_reply(current: _Reply):
+            nonlocal speech_deadline, end_deadline
             if current.sensitive:
                 spoken = "".join(current.output_fragments)
                 valid = bool(0 < current.audio_bytes <= sensitive_audio_limit and spoken and
                              _spoken_text(spoken) == _spoken_text(current.speech_text))
+                logger.info("Voice speech verification session=%s audio_bytes=%s output_chars=%s expected_chars=%s valid=%s",
+                            session_id, current.audio_bytes, len(spoken), len(current.speech_text), valid)
                 if valid:
                     await ws.send_json({"type": "audio_start", "response_id": current.response_id})
                     for frame in current.audio:
@@ -341,22 +388,44 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             elif current.sent_audio:
                 await ws.send_json({"type": "audio_end", "response_id": current.response_id})
             current.complete = True
+            speech_deadline = None
+            if current.end_session and end_deadline is None:
+                # Let the browser drain the full PCM reply before a bounded
+                # end-session fallback can close the socket.
+                playback_seconds = current.audio_bytes / (24000 * 2) if current.sent_audio else 0
+                end_deadline = time.monotonic() + playback_seconds + end_session_timeout_seconds
 
         while True:
             saw_event = False
             iterator = aiter(session.receive())
             while True:
                 try:
-                    if end_deadline is None:
+                    deadlines = [value for value in (end_deadline, speech_deadline) if value is not None]
+                    if not deadlines:
                         event = await iterator.__anext__()
                     else:
-                        event = await asyncio.wait_for(iterator.__anext__(), timeout=max(0.01, end_deadline - time.monotonic()))
+                        event = await asyncio.wait_for(iterator.__anext__(), timeout=max(0.01, min(deadlines) - time.monotonic()))
                 except StopAsyncIteration:
                     break
                 except asyncio.TimeoutError:
+                    if speech_deadline is not None and time.monotonic() >= speech_deadline:
+                        waiting = pending_spoken_reply or (reply if reply and not reply.complete else None)
+                        logger.info("Voice speech timeout session=%s pending=%s audio_bytes=%s output_chars=%s",
+                                    session_id, pending_spoken_reply is not None,
+                                    waiting.audio_bytes if waiting else 0,
+                                    len("".join(waiting.output_fragments)) if waiting else 0)
+                        pending_spoken_reply = None
+                        if waiting:
+                            reply = waiting
+                            await finish_reply(waiting)
+                        speech_deadline = None
+                        saw_event = True
+                        break
                     return await end_call()
                 saw_event = True
                 content = getattr(event, "server_content", None)
+                if content and getattr(content, "turn_complete", False):
+                    logger.info("Voice model turn complete session=%s", session_id)
                 was_interrupted = bool(content and getattr(content, "interrupted", False))
                 if was_interrupted:
                     interrupted_id = reply.response_id if reply else None
@@ -365,8 +434,15 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     await ws.send_json({"type": "interrupted", "response_id": interrupted_id})
                 transcript = getattr(content, "input_transcription", None) if content else None
                 if transcript and getattr(transcript, "text", None):
+                    logger.info("Voice input transcript session=%s chars=%s finished=%s", session_id,
+                                len(transcript.text), getattr(transcript, "finished", None))
+                if transcript and getattr(transcript, "text", None):
                     input_fragments.append(transcript.text)
-                if transcript and getattr(transcript, "finished", False):
+                # Current Gemini Live treats input_transcription itself as final
+                # and omits `finished`; older runtimes mark partials False.
+                final_without_flag = bool(transcript and getattr(transcript, "text", None) and
+                                          getattr(transcript, "finished", None) is None)
+                if transcript and (getattr(transcript, "finished", False) or final_without_flag):
                     if input_fragments:
                         latest_user_turn = " ".join(part.strip() for part in input_fragments if part.strip()).strip()
                         input_fragments.clear()
@@ -375,6 +451,24 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             decision = detect_language(latest_user_turn)
                             language = decision.language or language
                             await ws.send_json({"type": "transcript", "speaker": "user", "text": latest_user_turn, "final": True})
+                            if final_without_flag:
+                                await forward_without_model_tool()
+                if pending_spoken_reply and content and getattr(content, "turn_complete", False) and not was_interrupted:
+                    reply = pending_spoken_reply
+                    pending_spoken_reply = None
+                    try:
+                        await session.send_client_content(
+                            turns=types.Content(role="user", parts=[types.Part(text=
+                                "Speak this verified response exactly as written. Do not add, omit, or paraphrase words:\n"
+                                + reply.speech_text)]),
+                            turn_complete=True,
+                        )
+                        logger.info("Voice verified speech requested session=%s chars=%s", session_id, len(reply.speech_text))
+                        speech_deadline = time.monotonic() + speech_timeout_seconds
+                    except Exception as exc:
+                        logger.warning("Verified Voice speech request failed (%s)", type(exc).__name__)
+                        await finish_reply(reply)
+                    continue
                 output_transcript = getattr(content, "output_transcription", None) if content else None
                 current = reply if reply and not reply.interrupted and not reply.complete else None
                 if current and output_transcript and getattr(output_transcript, "text", None):
@@ -394,8 +488,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         await finish_reply(current)
                 tool_call = getattr(event, "tool_call", None)
                 calls = getattr(tool_call, "function_calls", None) or []
+                if calls:
+                    logger.info("Voice model tool calls session=%s count=%s", session_id, len(calls))
                 pending_tool_calls.extend(calls)
-                if latest_user_turn and pending_tool_calls:
+                if pending_tool_calls and (latest_user_turn or (reply and reply.complete)):
                     ready_calls, pending_tool_calls[:] = pending_tool_calls[:], []
                     await process_tool_calls(ready_calls)
                 if getattr(event, "go_away", None):
