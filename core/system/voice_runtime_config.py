@@ -67,7 +67,7 @@ class VoiceRuntimeConfig:
             model=model or "models/gemini-3.1-flash-live-preview",
             profile=profile,
             packet_duration_ms=_bounded_int("ZEPTAZ_VOICE_INPUT_PACKET_MS", 128, 20, 250),
-            end_silence_ms=_bounded_int("GEMINI_LIVE_END_SILENCE_MS", 800, 300, 1500),
+            end_silence_ms=_bounded_int("GEMINI_LIVE_END_SILENCE_MS", 700, 300, 1500),
             full_duplex=_enabled("ZEPTAZ_FULL_DUPLEX_ENABLED", True),
             context_compression=_enabled("GEMINI_LIVE_CONTEXT_COMPRESSION_ENABLED", True),
             protocol_version=_bounded_int("ZEPTAZ_VOICE_PROTOCOL_VERSION", 2, 2, 3),

@@ -123,12 +123,12 @@ def fake_genai_types(monkeypatch):
 
 
 async def run(ws, session, tools, adapter, *, max_session_seconds=2, end_session_timeout_seconds=5,
-              speech_timeout_seconds=45):
+              speech_timeout_seconds=45, protocol_version=2):
     return await app._run_hutch_live_session(
         ws=ws, session=session, tools=tools, adapter=adapter,
         binding_id="binding-1", session_id="voice-1", max_audio_bytes=100,
         max_session_seconds=max_session_seconds, end_session_timeout_seconds=end_session_timeout_seconds,
-        speech_timeout_seconds=speech_timeout_seconds,
+        speech_timeout_seconds=speech_timeout_seconds, protocol_version=protocol_version,
     )
 
 
@@ -290,7 +290,7 @@ async def test_no_finished_transcript_then_model_tool_reuses_one_resolve_result(
     assert len(tools.transcripts) == 1
     assert session.tool_responses[0].response["output"]["response_id"] == "response-1"
     assert session.tool_responses[0].response["session_memory_snapshot"]["latest_resolve_result"]["reply_text"] == "Grounded support response"
-    assert len(session.client_contents) == 1  # early snapshot request
+    assert len(session.client_contents) == 0  # tool result is the speech source
     await session.cycles.put([event(interrupted=True), event(complete=True)])
     await asyncio.sleep(0.01)
     assert not any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing)
@@ -314,7 +314,7 @@ async def test_late_tool_and_original_turn_completion_in_same_event_do_not_reque
         await asyncio.sleep(0.01)
     assert len(tools.transcripts) == 1
     assert len(session.tool_responses) == 1
-    assert len(session.client_contents) == 1  # early snapshot request
+    assert len(session.client_contents) == 0  # no competing snapshot after a tool call
     assert b"ungrounded" not in ws.outgoing
     await session.cycles.put([event(interrupted=True), event(complete=True)])
     await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
@@ -330,12 +330,20 @@ async def test_tool_call_after_interruption_boundary_reuses_resolve_result_and_s
     await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("response_id") == "response-1"
                                   for item in ws.outgoing))
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
     await session.cycles.put([event(interrupted=True), event(complete=True)])
     await session.cycles.put([event(audio=b"first grounded pcm", complete=True)])
     await ws.wait_for(lambda: b"first grounded pcm" in ws.outgoing)
     await session.cycles.put([event(transcript="My data stopped working", finished_missing=True)])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("response_id") == "response-2"
                                   for item in ws.outgoing))
+    for _ in range(50):
+        if len(session.client_contents) == 2:
+            break
+        await asyncio.sleep(0.01)
     await session.cycles.put([event(interrupted=True), event(complete=True)])
     await asyncio.sleep(0.01)
     assert len(session.client_contents) == 2
@@ -357,11 +365,150 @@ async def test_tool_call_after_interruption_boundary_reuses_resolve_result_and_s
 
 
 @pytest.mark.asyncio
+async def test_repeated_tool_calls_for_one_turn_never_repeat_resolve():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(tool_call=[call("first")])])
+    for _ in range(50):
+        if len(session.tool_responses) == 1:
+            break
+        await asyncio.sleep(0.01)
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
+    await session.cycles.put([event(tool_call=[call("second"), call("second")])])
+    for _ in range(50):
+        if len(session.tool_responses) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert [item.id for item in session.tool_responses] == ["first", "second"]
+    assert all(item.response["output"]["response_id"] == "response-1" for item in session.tool_responses)
+    assert len(tools.transcripts) == 1
+    await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
+    await ws.wait_for(lambda: b"grounded pcm" in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_call_is_never_answered():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                                  for item in ws.outgoing))
+    cancelled = event()
+    cancelled.tool_call_cancellation = type("Cancellation", (), {"ids": ["cancelled"]})()
+    await session.cycles.put([cancelled, event(tool_call=[call("cancelled")])])
+    await asyncio.sleep(0.02)
+    assert session.tool_responses == []
+    assert len(tools.transcripts) == 1
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_late_tool_receives_existing_resolve_error_instead_of_hanging():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools(failure="unavailable")
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True),
+                              event(tool_call=[call("failed")])])
+    for _ in range(50):
+        if len(session.tool_responses) == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert session.tool_responses[0].response["output"]["error"] == "unavailable"
+    assert len(tools.transcripts) == 1
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_provider_interruption_is_read_while_resolve_is_slow():
+    class SlowTools(FakeTools):
+        async def execute(self, name, *, transcript, language):
+            await asyncio.sleep(0.15)
+            return await super().execute(name, transcript=transcript, language=language)
+
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), SlowTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "transcript"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(interrupted=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "interrupted"
+                                  for item in ws.outgoing), timeout=0.1)
+    assert not any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                   for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_finalized_turns_arriving_during_slow_resolve_run_in_order():
+    class SlowTools(FakeTools):
+        async def execute(self, name, *, transcript, language):
+            await asyncio.sleep(0.08)
+            return await super().execute(name, transcript=transcript, language=language)
+
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), SlowTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="First balance question", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "transcript"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(transcript="Second data question", finished_missing=True)])
+    await ws.wait_for(lambda: len([item for item in ws.outgoing if isinstance(item, dict)
+                                   and item.get("type") == "resolve_result"]) == 2)
+    assert [item[0] for item in tools.transcripts] == ["First balance question", "Second data question"]
+    assert not any(isinstance(item, dict) and item.get("code") == "voice_turn_queue_full"
+                   for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_v3_caller_activity_stops_current_audio_and_rejects_old_frames():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=3))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(complete=True)])
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    assert session.client_contents
+    await session.cycles.put([event(audio=b"first pcm!")])
+    await ws.wait_for(lambda: b"first pcm!" in ws.outgoing)
+    await ws.incoming.put({"text": '{"type":"input_activity_start","segment_id":1}'})
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "interrupted"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(tool_call=[call("old-generation")])])
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert session.tool_responses[0].response["output"] == {"error": "ambiguous_generation"}
+    assert len(tools.transcripts) == 1
+    await session.cycles.put([event(audio=b"stale pcm!", complete=True)])
+    await asyncio.sleep(0.02)
+    assert b"stale pcm!" not in ws.outgoing
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
 async def test_early_snapshot_interrupt_drops_old_audio_then_streams_grounded_reply():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
     assert len(session.client_contents) == 1
     await session.cycles.put([event(audio=b"old ungrounded"), event(interrupted=True),
                               event(complete=True, audio=b"old tail")])
@@ -388,13 +535,13 @@ async def test_live_final_transcript_without_finished_uses_session_memory_and_st
         "transcript", "resolve_result",
     ]
     assert not any(isinstance(item, bytes) for item in ws.outgoing)
-    # If Gemini omits the interrupted boundary, drop the ambiguous turn and retry safely.
+    # If the original turn completes before the grace period, request only one snapshot.
     await session.cycles.put([event(complete=True, audio=b"ungrounded", output="Unverified words")])
     for _ in range(50):
-        if len(session.client_contents) >= 2:
+        if session.client_contents:
             break
         await asyncio.sleep(0.01)
-    assert len(session.client_contents) == 2
+    assert len(session.client_contents) == 1
     assert session.client_contents[0][1] is True
     assert 'hutch_resolve_session_memory_snapshot' in session.client_contents[0][0].parts[0].text
     assert "Grounded support response" in session.client_contents[0][0].parts[0].text
@@ -472,6 +619,11 @@ async def test_binary_audio_is_forwarded_and_audio_budget_closes_cleanly():
 async def test_v2_rejects_malformed_controls_and_early_or_mismatched_proposal_ack():
     assert app._grant_from_protocol("zeptaz-hutch-v1,hutch-grant.token") is None
     assert app._grant_from_protocol("zeptaz-hutch-v2,hutch-grant.token") == ("zeptaz-hutch-v2", "token")
+    assert app._grant_from_protocol("zeptaz-hutch-v3,hutch-grant.token") == ("zeptaz-hutch-v3", "token")
+    assert app._parse_browser_control('{"type":"input_activity_start","segment_id":1}') == {
+        "type": "input_activity_start", "segment_id": 1,
+    }
+    assert app._parse_browser_control('{"type":"input_activity_start","segment_id":true}') is None
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])

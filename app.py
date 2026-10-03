@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from uuid import uuid4
@@ -148,10 +149,10 @@ async def hutch_lifecycle_event(request: Request,
 
 
 def _grant_from_protocol(header: str) -> tuple[str, str] | None:
-    common = "zeptaz-hutch-v2"
     protocols = [part.strip() for part in header.split(",")]
     grant = next((item.removeprefix("hutch-grant.") for item in protocols if item.startswith("hutch-grant.")), None)
-    if common not in protocols or not grant:
+    common = next((version for version in ("zeptaz-hutch-v3", "zeptaz-hutch-v2") if version in protocols), None)
+    if common is None or not grant:
         return None
     return common, grant
 
@@ -183,13 +184,18 @@ def _parse_browser_control(raw: str) -> dict | None:
     control_type = value.get("type")
     fields = {
         "input_audio_end": {"type"},
+        "input_activity_start": {"type", "segment_id"},
+        "input_activity_end": {"type", "segment_id"},
         "playback_complete": {"type", "response_id"},
         "proposal_presented": {"type", "response_id", "proposal_id", "proposal_hash"},
     }
     if control_type not in fields or set(value) != fields[control_type]:
         return None
+    if control_type in {"input_activity_start", "input_activity_end"}:
+        if type(value["segment_id"]) is not int or not 1 <= value["segment_id"] <= 1_000_000_000:
+            return None
     if any(not isinstance(value[key], str) or not value[key] or len(value[key]) > 128
-           for key in fields[control_type] - {"type"}):
+           for key in fields[control_type] - {"type", "segment_id"}):
         return None
     return value
 
@@ -197,7 +203,8 @@ def _parse_browser_control(raw: str) -> dict | None:
 async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: str,
                                   session_id: str, max_audio_bytes: int,
                                   max_session_seconds: int, end_session_timeout_seconds: float = 5.0,
-                                  speech_timeout_seconds: float = 45.0):
+                                  speech_timeout_seconds: float = 45.0,
+                                  protocol_version: int = 2):
     """Supervise both sides of the live call until disconnect, failure, or Resolve end."""
     input_fragments: list[str] = []
     latest_user_turn = ""
@@ -207,6 +214,14 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
     end_deadline: float | None = None
     audio_bytes = 0
     output_audio_limit = 60 * 24000 * 2
+    caller_controls: asyncio.Queue[int] = asyncio.Queue(maxsize=4)
+    owned_tasks: set[asyncio.Task] = set()
+
+    def own_task(coro):
+        task = asyncio.create_task(coro)
+        owned_tasks.add(task)
+        task.add_done_callback(owned_tasks.discard)
+        return task
 
     async def end_call():
         await ws.send_json({"type": "ended", "reason": "resolve_requested"})
@@ -227,6 +242,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
     async def receive_audio():
         nonlocal audio_bytes
         audio_since_end = False
+        current_segment = 0
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
@@ -236,6 +252,15 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 control = _parse_browser_control(message["text"])
                 if control is None:
                     await ws.send_json({"type": "error", "code": "invalid_browser_control"})
+                    continue
+                if control["type"] in {"input_activity_start", "input_activity_end"}:
+                    if protocol_version < 3:
+                        await ws.send_json({"type": "error", "code": "invalid_browser_control"})
+                    elif control["type"] == "input_activity_start":
+                        if control["segment_id"] > current_segment:
+                            current_segment = control["segment_id"]
+                            if not caller_controls.full():
+                                caller_controls.put_nowait(current_segment)
                     continue
                 if control["type"] == "input_audio_end":
                     if audio_since_end:
@@ -277,9 +302,19 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
         nonlocal language, latest_user_turn, reply, end_deadline
         pending_spoken_reply: _Reply | None = None
         forwarded_without_tool: dict | None = None
+        answered_tool_ids: set[str] = set()
+        cancelled_tool_ids: set[str] = set()
         snapshot_sent_early = False
         original_turn_interrupted = False
+        original_turn_complete = False
+        tool_response_sent = False
+        tool_grace_deadline: float | None = None
         speech_deadline: float | None = None
+        forward_task: asyncio.Task | None = None
+        caller_epoch = 0
+        forward_task_epoch = 0
+        ambiguous_generation = False
+        queued_final_turns: deque[tuple[str, str, int]] = deque()
 
         async def request_snapshot_speech(current: _Reply):
             await session.send_client_content(
@@ -293,17 +328,17 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             logger.info("Voice response speech requested session=%s reply_chars=%s", session_id,
                         len(str(current.memory_snapshot["latest_resolve_result"]["reply_text"])))
 
-        async def forward_without_model_tool():
+        async def forward_without_model_tool(final_text: str, turn_language: str):
             nonlocal latest_user_turn, pending_spoken_reply, forwarded_without_tool
             nonlocal snapshot_sent_early, original_turn_interrupted, speech_deadline
-            final_text = latest_user_turn
-            latest_user_turn = ""
+            nonlocal tool_grace_deadline, original_turn_complete, tool_response_sent
             try:
-                response = await tools.execute(VOICE_TOOLS[0]["name"], transcript=final_text, language=language)
+                response = await tools.execute(VOICE_TOOLS[0]["name"], transcript=final_text, language=turn_language)
             except Exception as exc:
                 logger.warning("Resolve voice tool failed (%s)", type(exc).__name__)
                 response = {"error": "resolve_tool_failed"}
             if response.get("error"):
+                forwarded_without_tool = response
                 await ws.send_json({"type": "error", "code": "resolve_tool_failed",
                                     "message": "I couldn't complete that request. Please continue by text or try again."})
                 return
@@ -321,41 +356,45 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             speech_deadline = time.monotonic() + speech_timeout_seconds
             snapshot_sent_early = False
             original_turn_interrupted = False
+            original_turn_complete = False
+            tool_response_sent = False
             await ws.send_json({
                 "type": "resolve_result", "response_id": pending_spoken_reply.response_id,
                 "case_id": response.get("case_id"), "reply_text": response.get("reply_text"),
                 "pending_question": response.get("pending_question"), "proposal": response.get("proposal"),
                 "operation_status": response.get("operation_status"), "end_session": pending_spoken_reply.end_session,
             })
-            # Interrupt the original ungrounded answer now. Any already queued
-            # PCM is discarded until Gemini marks that old turn complete.
-            try:
-                await request_snapshot_speech(pending_spoken_reply)
-                snapshot_sent_early = True
-                speech_deadline = time.monotonic() + speech_timeout_seconds
-            except Exception as exc:
-                logger.warning("Voice early snapshot request failed (%s)", type(exc).__name__)
-                # The old turn can still complete normally; retry the snapshot then.
+            # Give a blocking Gemini tool call a short chance to arrive. Sending
+            # a second user turn while a tool call is pending can interrupt it.
+            tool_grace_deadline = time.monotonic() + 0.3
 
         async def process_tool_calls(calls):
             nonlocal latest_user_turn, reply, pending_spoken_reply, forwarded_without_tool
             nonlocal snapshot_sent_early, original_turn_interrupted, end_deadline, speech_deadline
+            nonlocal tool_grace_deadline, tool_response_sent
             for call in calls:
+                request_after_tool = False
+                if call.id in cancelled_tool_ids or call.id in answered_tool_ids:
+                    continue
                 if (call.name == VOICE_TOOLS[0]["name"] and forwarded_without_tool and
-                        (pending_spoken_reply or (reply and not reply.complete))):
+                        (forwarded_without_tool.get("error") or pending_spoken_reply or
+                         (reply and not reply.complete))):
                     # A no-finished transcription reached Resolve before Gemini's tool call.
                     # This may arrive even after the old turn's interruption boundary.
                     # Answer with the same result, never a second Resolve operation.
                     response = forwarded_without_tool
-                    forwarded_without_tool = None
+                    tool_grace_deadline = None
                     if pending_spoken_reply and not snapshot_sent_early:
-                        reply = pending_spoken_reply
-                        pending_spoken_reply = None
-                        original_turn_interrupted = False
+                        tool_response_sent = True
+                        if original_turn_complete:
+                            reply = pending_spoken_reply
+                            pending_spoken_reply = None
+                            request_after_tool = True
                     # When an early snapshot was sent, its interruption boundary
                     # can arrive after this tool response. Keep the reply pending
                     # so that boundary cannot revoke or expose its audio.
-                    speech_deadline = time.monotonic() + speech_timeout_seconds
+                    if not response.get("error") and speech_deadline is None:
+                        speech_deadline = time.monotonic() + speech_timeout_seconds
                     logger.info("Voice late model tool answered from existing Resolve result session=%s", session_id)
                 elif call.name != VOICE_TOOLS[0]["name"] or not latest_user_turn:
                     response = {"error": "no_finalized_caller_turn"}
@@ -394,6 +433,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 if not response.get("error"):
                     tool_output["session_memory_snapshot"] = session_memory_snapshot(response)
                 await session.send_tool_response(function_responses=[types.FunctionResponse(id=call.id, name=call.name, response=tool_output)])
+                answered_tool_ids.add(call.id)
+                if request_after_tool and reply and not response.get("error"):
+                    await request_snapshot_speech(reply)
+                    tool_response_sent = False
                 if reply and not response.get("error") and reply.speech_requested_at is None:
                     reply.speech_requested_at = time.monotonic()
 
@@ -416,16 +459,85 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
         while True:
             saw_event = False
             iterator = aiter(session.receive())
+            event_task: asyncio.Task | None = None
+            control_task: asyncio.Task | None = None
             while True:
                 try:
-                    deadlines = [value for value in (end_deadline, speech_deadline) if value is not None]
-                    if not deadlines:
-                        event = await iterator.__anext__()
-                    else:
-                        event = await asyncio.wait_for(iterator.__anext__(), timeout=max(0.01, min(deadlines) - time.monotonic()))
+                    deadlines = [value for value in (end_deadline, speech_deadline, tool_grace_deadline)
+                                 if value is not None]
+                    if event_task is None:
+                        event_task = own_task(iterator.__anext__())
+                    if protocol_version >= 3 and control_task is None:
+                        control_task = own_task(caller_controls.get())
+                    waiting = {event_task}
+                    if control_task is not None:
+                        waiting.add(control_task)
+                    if forward_task is not None:
+                        waiting.add(forward_task)
+                    timeout = max(0.01, min(deadlines) - time.monotonic()) if deadlines else None
+                    done, _ = await asyncio.wait(waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+                    if control_task is not None and control_task in done:
+                        segment_id = control_task.result()
+                        control_task = None
+                        caller_epoch += 1
+                        current_id = reply.response_id if reply and not reply.complete else (
+                            pending_spoken_reply.response_id if pending_spoken_reply else None)
+                        if current_id is not None or forward_task is not None:
+                            ambiguous_generation = True
+                            revoke_reply()
+                            pending_spoken_reply = None
+                            forwarded_without_tool = None
+                            tool_grace_deadline = None
+                            speech_deadline = None
+                            snapshot_sent_early = False
+                            pending_tool_calls.clear()
+                            await ws.send_json({"type": "interrupted", "response_id": current_id})
+                            logger.info("Voice caller activity session=%s segment=%s", session_id, segment_id)
+                        continue
+                    if forward_task is not None and forward_task in done:
+                        await forward_task
+                        forward_task = None
+                        if forward_task_epoch != caller_epoch:
+                            pending_spoken_reply = None
+                            forwarded_without_tool = None
+                            tool_grace_deadline = None
+                            speech_deadline = None
+                        if pending_tool_calls:
+                            ready_calls, pending_tool_calls[:] = pending_tool_calls[:], []
+                            await process_tool_calls(ready_calls)
+                        if queued_final_turns:
+                            next_text, next_language, next_epoch = queued_final_turns.popleft()
+                            latest_user_turn = ""
+                            revoke_reply(clear_presentation=False)
+                            pending_spoken_reply = None
+                            forwarded_without_tool = None
+                            tool_grace_deadline = None
+                            speech_deadline = None
+                            forward_task_epoch = next_epoch
+                            forward_task = own_task(forward_without_model_tool(next_text, next_language))
+                        continue
+                    if event_task not in done:
+                        raise asyncio.TimeoutError
+                    event = event_task.result()
+                    event_task = None
                 except StopAsyncIteration:
+                    if control_task is not None:
+                        control_task.cancel()
+                        await asyncio.gather(control_task, return_exceptions=True)
                     break
                 except asyncio.TimeoutError:
+                    if tool_grace_deadline is not None and time.monotonic() >= tool_grace_deadline:
+                        tool_grace_deadline = None
+                        if pending_spoken_reply and not tool_response_sent:
+                            try:
+                                await request_snapshot_speech(pending_spoken_reply)
+                                snapshot_sent_early = not original_turn_complete
+                                if original_turn_complete:
+                                    reply = pending_spoken_reply
+                                    pending_spoken_reply = None
+                            except Exception as exc:
+                                logger.warning("Voice snapshot request failed (%s)", type(exc).__name__)
+                        continue
                     if speech_deadline is not None and time.monotonic() >= speech_deadline:
                         waiting = pending_spoken_reply or (reply if reply and not reply.complete else None)
                         logger.info("Voice speech timeout session=%s pending=%s audio_bytes=%s",
@@ -433,6 +545,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                                     waiting.audio_bytes if waiting else 0)
                         pending_spoken_reply = None
                         forwarded_without_tool = None
+                        tool_grace_deadline = None
                         snapshot_sent_early = False
                         original_turn_interrupted = False
                         if waiting:
@@ -448,7 +561,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     logger.info("Voice model turn complete session=%s", session_id)
                 was_interrupted = bool(content and getattr(content, "interrupted", False))
                 if was_interrupted:
-                    if pending_spoken_reply and snapshot_sent_early:
+                    if pending_spoken_reply and (snapshot_sent_early or tool_response_sent):
                         # This is the old model answer being stopped by our own
                         # snapshot update, not a caller interruption.
                         original_turn_interrupted = True
@@ -457,6 +570,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         revoke_reply()
                         pending_spoken_reply = None
                         forwarded_without_tool = None
+                        tool_grace_deadline = None
                         snapshot_sent_early = False
                         original_turn_interrupted = False
                         pending_tool_calls.clear()
@@ -476,6 +590,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         latest_user_turn = " ".join(part.strip() for part in input_fragments if part.strip()).strip()
                         input_fragments.clear()
                         forwarded_without_tool = None
+                        tool_grace_deadline = None
                         snapshot_sent_early = False
                         original_turn_interrupted = False
                         revoke_reply(clear_presentation=False)
@@ -484,16 +599,36 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             language = decision.language or language
                             await ws.send_json({"type": "transcript", "speaker": "user", "text": latest_user_turn, "final": True})
                             if final_without_flag:
-                                await forward_without_model_tool()
+                                if forward_task is None:
+                                    forward_task_epoch = caller_epoch
+                                    final_text = latest_user_turn
+                                    latest_user_turn = ""
+                                    forward_task = own_task(forward_without_model_tool(final_text, language))
+                                elif len(queued_final_turns) < 2:
+                                    queued_final_turns.append((latest_user_turn, language, caller_epoch))
+                                    latest_user_turn = ""
+                                else:
+                                    latest_user_turn = ""
+                                    await ws.send_json({"type": "error", "code": "voice_turn_queue_full",
+                                                        "message": "I'm still processing earlier requests. Please try again shortly."})
                 tool_call = getattr(event, "tool_call", None)
                 calls = getattr(tool_call, "function_calls", None) or []
+                cancellation = getattr(event, "tool_call_cancellation", None)
+                cancelled = set(getattr(cancellation, "ids", None) or [])
+                if cancelled:
+                    cancelled_tool_ids.update(cancelled)
+                    pending_tool_calls[:] = [call for call in pending_tool_calls if call.id not in cancelled]
                 if pending_spoken_reply and content and getattr(content, "turn_complete", False) and not calls:
+                    original_turn_complete = True
+                    if tool_grace_deadline is not None and not tool_response_sent:
+                        continue
                     reply = pending_spoken_reply
                     pending_spoken_reply = None
-                    if not snapshot_sent_early or not original_turn_interrupted:
+                    if tool_response_sent or not snapshot_sent_early or not original_turn_interrupted:
                         # No explicit interruption boundary: the early request may
                         # already have spoken, but that audio was unproven and dropped.
-                        # Retry only after the old turn ends, preserving grounding.
+                        # A tool response may leave Gemini idle; explicitly request
+                        # speech only after the old turn has completed.
                         try:
                             await request_snapshot_speech(reply)
                             speech_deadline = time.monotonic() + speech_timeout_seconds
@@ -505,6 +640,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                                     session_id, round((time.monotonic() - reply.resolve_result_at) * 1000))
                     snapshot_sent_early = False
                     original_turn_interrupted = False
+                    tool_response_sent = False
                     continue
                 current = reply if reply and not reply.interrupted and not reply.complete else None
                 if current and content:
@@ -532,9 +668,20 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         await finish_reply(current)
                 if calls:
                     logger.info("Voice model tool calls session=%s count=%s", session_id, len(calls))
-                pending_tool_calls.extend(calls)
-                if pending_tool_calls and (latest_user_turn or pending_spoken_reply or
+                if calls and ambiguous_generation and forwarded_without_tool is None:
+                    # The provider does not attach a caller-turn ID to function
+                    # calls. Reject calls spanning an interruption instead of
+                    # attributing an old generation to the next caller turn.
+                    for call in calls:
+                        if call.id not in cancelled_tool_ids and call.id not in answered_tool_ids:
+                            await session.send_tool_response(function_responses=[types.FunctionResponse(
+                                id=call.id, name=call.name, response={"output": {"error": "ambiguous_generation"}})])
+                            answered_tool_ids.add(call.id)
+                    calls = []
+                pending_tool_calls.extend(call for call in calls if call.id not in cancelled_tool_ids)
+                if pending_tool_calls and ((latest_user_turn and forward_task is None) or pending_spoken_reply or
                                            (forwarded_without_tool and reply and not reply.complete) or
+                                           (forwarded_without_tool and forwarded_without_tool.get("error")) or
                                            (reply and reply.complete)):
                     ready_calls, pending_tool_calls[:] = pending_tool_calls[:], []
                     await process_tool_calls(ready_calls)
@@ -575,10 +722,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 return result
         return "disconnected"
     finally:
-        for task in tasks:
+        for task in tasks | owned_tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*(tasks | owned_tasks), return_exceptions=True)
 
 
 @app.websocket("/ws/hutch/{session_id}")
@@ -586,14 +733,14 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
     origin = (ws.headers.get("origin") or "").rstrip("/")
     offered = _grant_from_protocol(ws.headers.get("sec-websocket-protocol", ""))
     if not offered:
-        await ws.close(code=1008, reason="zeptaz_hutch_v2_required")
+        await ws.close(code=1008, reason="zeptaz_hutch_protocol_required")
         return
-    _, token = offered
+    selected_protocol, token = offered
     binding = app.state.store.consume_grant(token, session_id=session_id, origin=origin)
     if not binding:
         await ws.close(code=1008, reason="grant_invalid_or_used")
         return
-    await ws.accept(subprotocol="zeptaz-hutch-v2")
+    await ws.accept(subprotocol=selected_protocol)
     resolve = app.state.resolve
     session_started = time.monotonic()
     runtime_error: str | None = None
@@ -639,7 +786,7 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
         )
     try:
         async with _live_session(client, model, config) as session:
-            await ws.send_json({"type": "ready", "session_id": session_id, "provider": "gemini_live", "model": model, "live_profile": runtime_config.profile, "features": {"full_duplex":runtime_config.full_duplex,"context_compression":runtime_config.context_compression,"protocol_version":runtime_config.protocol_version}, "input_format": {"encoding": "pcm_s16le", "sample_rate": 16000}, "output_format": {"encoding": "pcm_s16le", "sample_rate": 24000}})
+            await ws.send_json({"type": "ready", "session_id": session_id, "provider": "gemini_live", "model": model, "live_profile": runtime_config.profile, "features": {"full_duplex":selected_protocol == "zeptaz-hutch-v3" and runtime_config.full_duplex,"context_compression":runtime_config.context_compression,"protocol_version":3 if selected_protocol == "zeptaz-hutch-v3" else 2}, "input_format": {"encoding": "pcm_s16le", "sample_rate": 16000}, "output_format": {"encoding": "pcm_s16le", "sample_rate": 24000}})
             await ws.send_json({"type": "greeting", "text": "HUTCH Resolve demo. Tell me what you need help with."})
             await _run_hutch_live_session(
                 ws=ws, session=session, tools=tools, adapter=adapter,
@@ -647,6 +794,7 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
                 max_audio_bytes=int(os.getenv("HUTCH_VOICE_MAX_AUDIO_BYTES", "3840000")),
                 max_session_seconds=int(os.getenv("HUTCH_VOICE_MAX_SESSION_SECONDS", "120")),
                 end_session_timeout_seconds=float(os.getenv("HUTCH_VOICE_END_SESSION_TIMEOUT_SECONDS", "5")),
+                protocol_version=3 if selected_protocol == "zeptaz-hutch-v3" else 2,
             )
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass
