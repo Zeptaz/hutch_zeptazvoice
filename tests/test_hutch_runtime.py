@@ -151,7 +151,7 @@ async def test_split_final_transcription_is_forwarded_and_receive_cycles_handle_
 
 
 @pytest.mark.asyncio
-async def test_proposal_ack_lifecycle_and_interruption_revoke_presentation_eligibility():
+async def test_streamed_proposal_never_authorizes_spoken_presentation():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
@@ -162,8 +162,8 @@ async def test_proposal_ack_lifecycle_and_interruption_revoke_presentation_eligi
     await ws.wait_for(lambda: any(item.get("type") == "playback_ack" for item in ws.outgoing if isinstance(item, dict)))
     await ws.incoming.put({"text": '{"type":"proposal_presented","response_id":"response-1","proposal_id":"proposal-1","proposal_hash":"hash-1"}'})
     await ws.wait_for(lambda: any(item.get("type") == "proposal_ack" for item in ws.outgoing if isinstance(item, dict)))
-    assert ws.outgoing[-1] == {"type": "proposal_ack", "response_id": "response-1", "accepted": True}
-    assert adapter.presented_proposal is not None
+    assert ws.outgoing[-1] == {"type": "proposal_ack", "response_id": "response-1", "accepted": False}
+    assert adapter.presented_proposal is None
     await session.cycles.put([event(interrupted=True)])
     await ws.wait_for(lambda: any(item.get("type") == "interrupted" for item in ws.outgoing if isinstance(item, dict)))
     assert ws.outgoing[-1] == {"type": "interrupted", "response_id": "response-1"}
@@ -273,7 +273,7 @@ async def test_incomplete_transcription_is_never_sent_to_resolve():
 
 
 @pytest.mark.asyncio
-async def test_live_final_transcript_without_finished_or_tool_uses_grounded_browser_speech():
+async def test_live_final_transcript_without_finished_uses_session_memory_and_streams_speech():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
@@ -283,18 +283,22 @@ async def test_live_final_transcript_without_finished_or_tool_uses_grounded_brow
         "transcript", "resolve_result",
     ]
     assert not any(isinstance(item, bytes) for item in ws.outgoing)
-    # Discard the original ungrounded model turn, then request exact speech.
+    # Discard the original ungrounded model turn, then give Live the Resolve snapshot.
     await session.cycles.put([event(complete=True, audio=b"ungrounded", output="Unverified words")])
     for _ in range(50):
         if session.client_contents:
             break
         await asyncio.sleep(0.01)
     assert session.client_contents[0][1] is True
+    assert 'hutch_resolve_session_memory_snapshot' in session.client_contents[0][0].parts[0].text
     assert "Grounded support response" in session.client_contents[0][0].parts[0].text
     assert b"ungrounded" not in ws.outgoing
-    await session.cycles.put([event(complete=True, audio=b"verified audio", output="Grounded support response")])
-    await ws.wait_for(lambda: b"verified audio" in ws.outgoing)
-    assert not any(isinstance(item, dict) and item.get("type") == "audio_fallback" for item in ws.outgoing)
+    await session.cycles.put([event(audio=b"streamed audio", output="Different wording")])
+    await ws.wait_for(lambda: b"streamed audio" in ws.outgoing)
+    assert any(isinstance(item, dict) and item.get("type") == "audio_start" for item in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing)
+    await session.cycles.put([event(complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
     await session.cycles.put([event(tool_call=[call("late-model-tool")])])
     for _ in range(50):
         if session.tool_responses:
@@ -389,7 +393,7 @@ async def test_zero_audio_cannot_be_acknowledged_and_later_model_audio_is_droppe
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
     await session.cycles.put([event(complete=True, output="Grounded support response")])
-    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_fallback" for item in ws.outgoing))
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing))
     await ws.incoming.put({"text": '{"type":"playback_complete","response_id":"response-1"}'})
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "playback_ack" for item in ws.outgoing))
     assert ws.outgoing[-1]["accepted"] is False
@@ -401,14 +405,16 @@ async def test_zero_audio_cannot_be_acknowledged_and_later_model_audio_is_droppe
 
 
 @pytest.mark.asyncio
-async def test_sensitive_speech_mismatch_discards_audio_and_proposal_eligibility():
+async def test_model_audio_streams_without_transcript_comparison_but_proposal_stays_tap_only():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
-    await session.cycles.put([event(complete=True, audio=b"bad audio", output="Different consequence")])
-    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_fallback" for item in ws.outgoing))
-    assert b"bad audio" not in ws.outgoing
+    await session.cycles.put([event(audio=b"live pcm", output="Different wording")])
+    await ws.wait_for(lambda: b"live pcm" in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing)
+    await session.cycles.put([event(complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
     await ws.incoming.put({"text": '{"type":"playback_complete","response_id":"response-1"}'})
     await ws.incoming.put({"text": '{"type":"proposal_presented","response_id":"response-1","proposal_id":"proposal-1","proposal_hash":"hash-1"}'})
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "proposal_ack" for item in ws.outgoing))
@@ -418,18 +424,21 @@ async def test_sensitive_speech_mismatch_discards_audio_and_proposal_eligibility
 
 
 @pytest.mark.asyncio
-async def test_ordinary_resolve_reply_mismatch_cannot_play_unverified_financial_audio():
+async def test_tool_reply_carries_resolve_session_memory_without_audio_buffering():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="What happened to my bill?", complete=True), event(tool_call=[call()])])
     await ws.wait_for(lambda: any(item.get("type") == "resolve_result" for item in ws.outgoing if isinstance(item, dict)))
-    # The invented claim differs from Resolve's canonical text and must never reach the caller.
-    await session.cycles.put([event(complete=True, audio=b"false refund audio", output="Your LKR 8,000 refund was approved.")])
-    await ws.wait_for(lambda: any(item.get("type") == "audio_fallback" for item in ws.outgoing if isinstance(item, dict)))
-    assert b"false refund audio" not in ws.outgoing
-    assert not any(isinstance(item, dict) and item.get("type") == "transcript" and item.get("speaker") == "assistant" for item in ws.outgoing)
-    fallback = next(item for item in ws.outgoing if isinstance(item, dict) and item.get("type") == "audio_fallback")
-    assert fallback["text"] == "Grounded support response"
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert session.tool_responses[0].response["session_memory_snapshot"]["latest_resolve_result"]["reply_text"] == "Grounded support response"
+    await session.cycles.put([event(audio=b"first pcm0")])
+    await ws.wait_for(lambda: b"first pcm0" in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing)
+    await session.cycles.put([event(complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 
@@ -451,7 +460,7 @@ async def test_resolve_tool_failure_emits_typed_error_and_never_forwards_model_c
         "message": "I couldn’t complete that request. Please continue by text or try again.",
     }]
     assert b"fabricated claim" not in ws.outgoing
-    assert not any(isinstance(item, dict) and item.get("type") in {"resolve_result", "audio_fallback"} for item in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing)
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 
@@ -463,16 +472,16 @@ async def test_coalesced_completion_and_tool_call_cannot_end_before_new_reply():
     await session.cycles.put([event(transcript="Goodbye", complete=True, tool_call=[call()])])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
     assert ws.closed is None
-    await session.cycles.put([event(complete=True, audio=b"final", output="Grounded support response")])
-    await ws.wait_for(lambda: b"final" in ws.outgoing)
+    await session.cycles.put([event(complete=True, audio=b"final pcm0", output="Grounded support response")])
+    await ws.wait_for(lambda: b"final pcm0" in ws.outgoing)
     assert ws.closed is None
     await ws.incoming.put({"text": '{"type":"playback_complete","response_id":"response-1"}'})
     assert await task == "ended"
-    assert ws.outgoing.index(b"final") < next(i for i, item in enumerate(ws.outgoing) if isinstance(item, dict) and item.get("type") == "ended")
+    assert ws.outgoing.index(b"final pcm0") < next(i for i, item in enumerate(ws.outgoing) if isinstance(item, dict) and item.get("type") == "ended")
 
 
 @pytest.mark.asyncio
-async def test_interruption_discards_buffered_sensitive_audio():
+async def test_interruption_stops_later_model_audio():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
@@ -480,20 +489,20 @@ async def test_interruption_discards_buffered_sensitive_audio():
     await session.cycles.put([event(audio=b"unverified")])
     await session.cycles.put([event(interrupted=True), event(complete=True, output="Grounded support response")])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing))
-    assert b"unverified" not in ws.outgoing
+    assert b"unverified" in ws.outgoing
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 
 
 @pytest.mark.asyncio
-async def test_sensitive_audio_overflow_falls_back_to_approved_text():
+async def test_oversized_single_output_frame_is_rejected_without_playback():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
-    oversized = b"\x00\x00" * (30 * 24000 + 1)
+    oversized = b"\x00\x00" * (60 * 24000 + 1)
     await session.cycles.put([event(complete=True, audio=oversized, output="Grounded support response")])
-    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_fallback" for item in ws.outgoing))
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing))
     assert oversized not in ws.outgoing
     assert not any(isinstance(item, dict) and item.get("type") == "audio_start" for item in ws.outgoing)
     await ws.incoming.put({"type": "websocket.disconnect"})
