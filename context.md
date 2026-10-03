@@ -23,4 +23,5 @@ The prior 15-test baseline and ephemeral streaming failure are superseded by the
 - [x] Voice system instructions require reciting those exact terms. Confirmation still requires the response-scoped acknowledged proposal and a fresh affirmative final transcript; tool/model output cannot authorize an action.
 - [x] Voice suite: 49 passed; `git diff --check` passed.
 - [x] Resolve v1.1 package counterpart is committed and pushed as `hutch_resolve/ResolveDev` commit `d5c881a`.
+- [x] Voice adapter package confirmation commit `93a0a1b` is pushed to `adapter_buildation` and remotely confirmed.
 - [ ] Disposable PostgreSQL now verifies migration/reset, concurrent same-offer confirmation, one debit/subscription/provider operation and Trust Receipt. Package-specific crash/lost-response and injected-provider-failure recovery still need qualification; the Resolve package feature flag remains false by default.
