@@ -687,6 +687,30 @@ async def test_zero_audio_completion_retries_saved_resolve_speech_once_then_spea
 
 
 @pytest.mark.asyncio
+async def test_thirty_sequential_turns_reuse_one_session_without_duplicate_resolve_calls():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, max_session_seconds=10))
+    for index in range(30):
+        response_id = f"response-{index + 1}"
+        await session.cycles.put([event(transcript=f"Question {index + 1}", complete=True,
+                                        tool_call=[call(f"call-{index + 1}")])])
+        await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                                      and item.get("response_id") == response_id for item in ws.outgoing))
+        await session.cycles.put([event(audio=b"safe pcm00", complete=True)])
+        await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end"
+                                      and item.get("response_id") == response_id for item in ws.outgoing))
+        await ws.incoming.put({"text": f'{{"type":"playback_complete","response_id":"{response_id}"}}'})
+        await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "playback_ack"
+                                      and item.get("response_id") == response_id and item.get("accepted")
+                                      for item in ws.outgoing))
+    assert len(tools.transcripts) == 30
+    assert len(session.tool_responses) == 30
+    assert not any(isinstance(item, dict) and item.get("type") == "error" for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
 async def test_first_pcm_watchdog_retries_once_then_reports_unavailable():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter, speech_timeout_seconds=0.3,
