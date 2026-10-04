@@ -891,3 +891,63 @@ async def test_v3_preroll_is_bounded_and_mute_discards_it():
     assert session.realtime_events == [
         "start", b"b" * 3200 + b"c" * 3200 + b"d" * 3200, "end", "start", "end",
     ]
+
+
+@pytest.mark.asyncio
+async def test_late_tool_continuation_streams_without_a_second_speech_request():
+    """The grounded continuation after a late tool response is the reply; it is not discarded and re-requested."""
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    await session.cycles.put([event(audio=b"ungrounded preamble!"), event(tool_call=[call()])])
+    for _ in range(100):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert len(session.tool_responses) == 1
+    await session.cycles.put([event(audio=b"grounded continuation!")])
+
+    await ws.wait_for(lambda: b"grounded continuation!" in ws.outgoing)
+    assert b"ungrounded preamble!" not in ws.outgoing
+    await session.cycles.put([event(audio=b"more", complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
+    assert session.client_contents == []  # no second generation of the same reply
+    assert len(tools.transcripts) == 1
+    assert [item["type"] for item in ws.outgoing if isinstance(item, dict) and item.get("type") in {"audio_start", "audio_end"}] == ["audio_start", "audio_end"]
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+class CountingSession(FakeSession):
+    def __init__(self):
+        super().__init__()
+        self.active_receives = 0
+        self.max_active_receives = 0
+
+    async def receive(self):
+        self.active_receives += 1
+        self.max_active_receives = max(self.max_active_receives, self.active_receives)
+        try:
+            async for item in super().receive():
+                yield item
+        finally:
+            self.active_receives -= 1
+
+
+@pytest.mark.asyncio
+async def test_speech_timeout_keeps_a_single_provider_read():
+    """A timed-out reply must not start a second concurrent receive on the Live socket (ConcurrencyError)."""
+    ws, session, adapter, tools = FakeWebSocket(), CountingSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, speech_timeout_seconds=0.05,
+                                   first_audio_timeout_seconds=0.02))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing))
+    await asyncio.sleep(0.05)
+    assert session.max_active_receives == 1
+    await session.cycles.put([event(complete=True)])
+    await session.cycles.put([event(transcript="Next question", finished_missing=True)])
+    await ws.wait_for(lambda: len(tools.transcripts) == 2)
+    assert session.max_active_receives == 1
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"

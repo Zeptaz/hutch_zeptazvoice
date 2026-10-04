@@ -42,3 +42,19 @@ def test_v3_activity_config_uses_browser_vad_and_v2_keeps_provider_vad():
     assert v3.activity_handling == app.types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS
     assert v2.automatic_activity_detection.disabled is False
     assert no_barge_in.activity_handling == app.types.ActivityHandling.NO_INTERRUPTION
+
+
+def test_input_transcription_hints_sri_lankan_languages_by_default(monkeypatch):
+    monkeypatch.delenv("GEMINI_LIVE_INPUT_LANGUAGES", raising=False)
+    config = VoiceRuntimeConfig.from_environment()
+    assert config.input_language_codes == ("si-LK", "en-US", "ta-IN")
+    transcription = app._input_transcription_config(config.input_language_codes)
+    assert transcription.language_codes == ["si-LK", "en-US", "ta-IN"]
+    assert "VAS" in transcription.custom_vocabulary
+
+
+def test_input_language_override_and_invalid_value(monkeypatch):
+    monkeypatch.setenv("GEMINI_LIVE_INPUT_LANGUAGES", "si-LK, en-US")
+    assert VoiceRuntimeConfig.from_environment().input_language_codes == ("si-LK", "en-US")
+    monkeypatch.setenv("GEMINI_LIVE_INPUT_LANGUAGES", "sinhala please")
+    assert VoiceRuntimeConfig.from_environment().input_language_codes == ("si-LK", "en-US", "ta-IN")

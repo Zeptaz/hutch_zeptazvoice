@@ -201,6 +201,15 @@ def _parse_browser_control(raw: str) -> dict | None:
     return value
 
 
+# Telecom terms callers say in English inside Sinhala/Tamil speech; biases recognition toward them.
+INPUT_VOCABULARY = ["HUTCH", "VAS", "VAS charges", "value added service", "reload", "recharge", "balance",
+                    "data package", "package", "SIM", "top up"]
+
+
+def _input_transcription_config(language_codes) -> types.AudioTranscriptionConfig:
+    return types.AudioTranscriptionConfig(language_codes=list(language_codes), custom_vocabulary=INPUT_VOCABULARY)
+
+
 def _realtime_input_config(*, protocol_version: int, end_silence_ms: int, full_duplex: bool):
     """V3 uses the browser's validated activity boundaries as the sole VAD."""
     return types.RealtimeInputConfig(
@@ -443,6 +452,9 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     tool_grace_deadline = None
                     if pending_spoken_reply and not snapshot_sent_early:
                         tool_response_sent = True
+                        # Gemini continues the turn from this grounded tool result; that
+                        # continuation streams as the reply instead of being discarded.
+                        pending_spoken_reply.speech_requested_at = time.monotonic()
                         if original_turn_complete:
                             reply = pending_spoken_reply
                             pending_spoken_reply = None
@@ -512,6 +524,32 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 # end-session fallback can close the socket.
                 playback_seconds = current.audio_bytes / (24000 * 2) if current.sent_audio else 0
                 end_deadline = time.monotonic() + playback_seconds + end_session_timeout_seconds
+
+        def tool_continuation_speaking() -> bool:
+            return bool(pending_spoken_reply and tool_response_sent and not snapshot_sent_early and
+                        not pending_spoken_reply.interrupted and not pending_spoken_reply.complete)
+
+        async def stream_pcm(current: _Reply, content) -> None:
+            for part in (getattr(getattr(content, "model_turn", None), "parts", None) or []):
+                inline = getattr(part, "inline_data", None)
+                if inline and getattr(inline, "data", None):
+                    frame = bytes(inline.data)
+                    if len(frame) % 2 or current.audio_bytes + len(frame) > output_audio_limit:
+                        logger.warning("Voice output limit or invalid PCM session=%s bytes=%s", session_id,
+                                       current.audio_bytes + len(frame))
+                        await finish_reply(current)
+                        return
+                    if not current.sent_audio:
+                        now = time.monotonic()
+                        logger.info("Voice first grounded PCM session=%s response=%s after_resolve_ms=%d after_speech_request_ms=%s",
+                                    session_id, current.response_id,
+                                    round((now - current.resolve_result_at) * 1000),
+                                    round((now - current.speech_requested_at) * 1000)
+                                    if current.speech_requested_at is not None else "unknown")
+                        await ws.send_json({"type": "audio_start", "response_id": current.response_id})
+                        current.sent_audio = True
+                    current.audio_bytes += len(frame)
+                    await ws.send_bytes(frame)
 
         while True:
             saw_event = False
@@ -607,8 +645,9 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         if await retry_snapshot_speech(reply):
                             continue
                         await finish_reply(reply)
-                        saw_event = True
-                        break
+                        # Keep the pending provider read: breaking here would start a
+                        # second concurrent receive on the same Live socket.
+                        continue
                     if speech_deadline is not None and time.monotonic() >= speech_deadline:
                         waiting = pending_spoken_reply or (reply if reply and not reply.complete else None)
                         logger.info("Voice speech timeout session=%s pending=%s audio_bytes=%s",
@@ -623,8 +662,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             reply = waiting
                             await finish_reply(waiting)
                         speech_deadline = None
-                        saw_event = True
-                        break
+                        continue
                     return await end_call()
                 saw_event = True
                 content = getattr(event, "server_content", None)
@@ -632,7 +670,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     logger.info("Voice model turn complete session=%s", session_id)
                 was_interrupted = bool(content and getattr(content, "interrupted", False))
                 if was_interrupted:
-                    if pending_spoken_reply and (snapshot_sent_early or tool_response_sent):
+                    if (pending_spoken_reply and not pending_spoken_reply.sent_audio and
+                            (snapshot_sent_early or tool_response_sent)):
                         # This is the old model answer being stopped by our own
                         # snapshot update, not a caller interruption.
                         original_turn_interrupted = True
@@ -691,6 +730,18 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     pending_tool_calls[:] = [call for call in pending_tool_calls if call.id not in cancelled]
                 if pending_spoken_reply and content and getattr(content, "turn_complete", False) and not calls:
                     original_turn_complete = True
+                    if tool_continuation_speaking():
+                        spoken = pending_spoken_reply
+                        await stream_pcm(spoken, content)
+                        if spoken.sent_audio:
+                            reply = spoken
+                            pending_spoken_reply = None
+                            snapshot_sent_early = False
+                            original_turn_interrupted = False
+                            tool_response_sent = False
+                            if not spoken.complete:
+                                await finish_reply(spoken)
+                            continue
                     if tool_grace_deadline is not None and not tool_response_sent:
                         continue
                     reply = pending_spoken_reply
@@ -714,27 +765,11 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     tool_response_sent = False
                     continue
                 current = reply if reply and not reply.interrupted and not reply.complete else None
+                if current is None and tool_continuation_speaking():
+                    # Audio after the late tool response is grounded in the Resolve result.
+                    await stream_pcm(pending_spoken_reply, content)
                 if current and content:
-                    for part in (getattr(getattr(content, "model_turn", None), "parts", None) or []):
-                        inline = getattr(part, "inline_data", None)
-                        if inline and getattr(inline, "data", None):
-                            frame = bytes(inline.data)
-                            if len(frame) % 2 or current.audio_bytes + len(frame) > output_audio_limit:
-                                logger.warning("Voice output limit or invalid PCM session=%s bytes=%s", session_id,
-                                               current.audio_bytes + len(frame))
-                                await finish_reply(current)
-                                break
-                            if not current.sent_audio:
-                                now = time.monotonic()
-                                logger.info("Voice first grounded PCM session=%s response=%s after_resolve_ms=%d after_speech_request_ms=%s",
-                                            session_id, current.response_id,
-                                            round((now - current.resolve_result_at) * 1000),
-                                            round((now - current.speech_requested_at) * 1000)
-                                            if current.speech_requested_at is not None else "unknown")
-                                await ws.send_json({"type": "audio_start", "response_id": current.response_id})
-                                current.sent_audio = True
-                            current.audio_bytes += len(frame)
-                            await ws.send_bytes(frame)
+                    await stream_pcm(current, content)
                     if not current.complete and getattr(content, "turn_complete", False) and not was_interrupted:
                         if not current.sent_audio and await retry_snapshot_speech(current):
                             continue
@@ -846,7 +881,7 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"], temperature=0.2,
         system_instruction=SYSTEM_INSTRUCTION, tools=tool_declarations,
-        input_audio_transcription=types.AudioTranscriptionConfig(),
+        input_audio_transcription=_input_transcription_config(runtime_config.input_language_codes),
         # V3 already has browser VAD with noise filtering and numbered activity
         # boundaries. Disable Gemini's independent detector there so raw-mic echo
         # or noise rejected by the browser cannot independently interrupt speech.
