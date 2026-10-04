@@ -9,6 +9,7 @@
 | Event / track | IgnitX 2026 · Track A: Resolve & Support |
 | Release | `v1.0.1` in both repositories (tagged 4 October 2026) |
 | Live demo | https://resolve.zeptaz.com (sign in on `/chat`, then start a call) |
+| Demo video | [Google Drive](https://drive.google.com/drive/folders/1W-2ktmFYeZHLNYF7e67zjlPjy3Sb8_l3?usp=sharing) |
 | Main repository | [`Zeptaz/hutch_resolve`](https://github.com/Zeptaz/hutch_resolve): Resolve backend, chat, agent dashboard and the full project README |
 
 > All data is **synthetic**. No HUTCH system, real customer record or call recording is used. Audio is streamed and never stored.
