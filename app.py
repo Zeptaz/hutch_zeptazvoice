@@ -574,9 +574,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             decision_task: asyncio.Task | None = None
             while True:
                 try:
+                    # An interrupted reply is abandoned: its first-audio watchdog must not fire.
                     current_first_audio_deadline = (
                         reply.speech_requested_at + min(first_audio_timeout_seconds, speech_timeout_seconds)
-                        if reply and not reply.sent_audio and not reply.complete and
+                        if reply and not reply.sent_audio and not reply.complete and not reply.interrupted and
                         reply.speech_requested_at is not None else None
                     )
                     deadlines = [value for value in (end_deadline, speech_deadline, tool_grace_deadline,
@@ -698,8 +699,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                                 logger.warning("Voice snapshot request failed (%s)", type(exc).__name__)
                         continue
                     if (current_first_audio_deadline is not None and
-                            time.monotonic() >= current_first_audio_deadline and
-                            speech_deadline is not None and time.monotonic() < speech_deadline and reply):
+                            time.monotonic() >= current_first_audio_deadline and reply and
+                            (speech_deadline is None or time.monotonic() < speech_deadline)):
                         if await retry_snapshot_speech(reply):
                             continue
                         await finish_reply(reply)
@@ -721,7 +722,11 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             await finish_reply(waiting)
                         speech_deadline = None
                         continue
-                    return await end_call()
+                    # Only Resolve's end_session deadline ends the call. Any other expired
+                    # watchdog is stale (e.g. its reply was interrupted) and must not hang up.
+                    if end_deadline is not None and time.monotonic() >= end_deadline:
+                        return await end_call()
+                    continue
                 saw_event = True
                 content = getattr(event, "server_content", None)
                 if content and getattr(content, "turn_complete", False):
@@ -894,6 +899,24 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
         await asyncio.gather(*(tasks | owned_tasks), return_exceptions=True)
 
 
+DEFAULT_MAX_SESSION_SECONDS = 600
+# The browser streams the microphone for the whole call (16 kHz PCM16 = 32,000 bytes/s).
+INPUT_BYTES_PER_SECOND = 32000
+
+
+def _max_session_seconds() -> int:
+    return int(os.getenv("HUTCH_VOICE_MAX_SESSION_SECONDS", str(DEFAULT_MAX_SESSION_SECONDS)))
+
+
+def _max_audio_bytes(max_session_seconds: int) -> int:
+    """The audio budget must outlast the call: only the call time limit may end a call, not the budget."""
+    needed = max_session_seconds * INPUT_BYTES_PER_SECOND + 10 * INPUT_BYTES_PER_SECOND
+    configured = int(os.getenv("HUTCH_VOICE_MAX_AUDIO_BYTES", str(needed)))
+    if configured < needed:
+        logger.warning("HUTCH_VOICE_MAX_AUDIO_BYTES is below the call limit's audio; using %s", needed)
+    return max(configured, needed)
+
+
 @app.websocket("/ws/hutch/{session_id}")
 async def hutch_audio_socket(ws: WebSocket, session_id: str):
     origin = (ws.headers.get("origin") or "").rstrip("/")
@@ -955,14 +978,15 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
             trigger_tokens=32768, sliding_window=types.SlidingWindow(target_tokens=16384)
         )
     try:
+        max_session_seconds = _max_session_seconds()
         async with _live_session(client, model, config) as session:
-            await ws.send_json({"type": "ready", "session_id": session_id, "provider": "gemini_live", "model": model, "live_profile": runtime_config.profile, "features": {"full_duplex":PROTOCOL_VERSIONS[selected_protocol] >= 3 and runtime_config.full_duplex,"context_compression":runtime_config.context_compression,"protocol_version":PROTOCOL_VERSIONS[selected_protocol]}, "input_format": {"encoding": "pcm_s16le", "sample_rate": 16000}, "output_format": {"encoding": "pcm_s16le", "sample_rate": 24000}})
+            await ws.send_json({"type": "ready", "session_id": session_id, "max_session_seconds": max_session_seconds, "provider": "gemini_live", "model": model, "live_profile": runtime_config.profile, "features": {"full_duplex":PROTOCOL_VERSIONS[selected_protocol] >= 3 and runtime_config.full_duplex,"context_compression":runtime_config.context_compression,"protocol_version":PROTOCOL_VERSIONS[selected_protocol]}, "input_format": {"encoding": "pcm_s16le", "sample_rate": 16000}, "output_format": {"encoding": "pcm_s16le", "sample_rate": 24000}})
             await ws.send_json({"type": "greeting", "text": "HUTCH Resolve demo. Tell me what you need help with."})
             await _run_hutch_live_session(
                 ws=ws, session=session, tools=tools, adapter=adapter,
                 binding_id=binding["binding_id"], session_id=session_id,
-                max_audio_bytes=int(os.getenv("HUTCH_VOICE_MAX_AUDIO_BYTES", "3840000")),
-                max_session_seconds=int(os.getenv("HUTCH_VOICE_MAX_SESSION_SECONDS", "120")),
+                max_audio_bytes=_max_audio_bytes(max_session_seconds),
+                max_session_seconds=max_session_seconds,
                 end_session_timeout_seconds=float(os.getenv("HUTCH_VOICE_END_SESSION_TIMEOUT_SECONDS", "5")),
                 protocol_version=PROTOCOL_VERSIONS[selected_protocol],
             )

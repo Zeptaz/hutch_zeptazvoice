@@ -1042,3 +1042,34 @@ async def test_v3_rejects_the_screen_decision_control():
 def test_v4_is_preferred_and_v3_still_accepted():
     assert app._grant_from_protocol("zeptaz-hutch-v4, zeptaz-hutch-v3, hutch-grant.abc") == ("zeptaz-hutch-v4", "abc")
     assert app._grant_from_protocol("zeptaz-hutch-v3, hutch-grant.abc") == ("zeptaz-hutch-v3", "abc")
+
+
+@pytest.mark.asyncio
+async def test_interrupting_a_reply_before_its_audio_never_hangs_up_the_call():
+    # Regression: the first-audio watchdog of an interrupted reply fell through to end_call().
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    tools.decision_replies = {"proposal-9": DECISION_REPLY}
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=4,
+                                   first_audio_timeout_seconds=0.05, max_session_seconds=3))
+    await ws.incoming.put({"type": "websocket.receive", "text": '{"type":"decision_recorded","proposal_id":"proposal-9"}'})
+    await ws.wait_for(lambda: _sent(ws, "resolve_result"))
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    assert session.client_contents
+    await ws.incoming.put({"text": '{"type":"input_activity_start","segment_id":1}'})
+    await ws.wait_for(lambda: _sent(ws, "interrupted"))
+    await asyncio.sleep(0.3)  # well past the first-audio watchdog
+    assert not _sent(ws, "ended") and ws.closed is None and not task.done()
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+def test_audio_budget_always_outlasts_the_call_limit(monkeypatch):
+    monkeypatch.setenv("HUTCH_VOICE_MAX_AUDIO_BYTES", "3840000")
+    assert app._max_audio_bytes(600) >= 600 * 32000
+    monkeypatch.delenv("HUTCH_VOICE_MAX_AUDIO_BYTES")
+    monkeypatch.delenv("HUTCH_VOICE_MAX_SESSION_SECONDS", raising=False)
+    assert app._max_session_seconds() == 600
+    assert app._max_audio_bytes(app._max_session_seconds()) >= 600 * 32000
