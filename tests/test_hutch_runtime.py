@@ -6,9 +6,10 @@ import pytest
 import app
 
 
-def event(*, transcript=None, transcript_finished=None, complete=False, tool_call=None, interrupted=False, audio=None, output=None):
+def event(*, transcript=None, transcript_finished=None, finished_missing=False, complete=False, tool_call=None, interrupted=False, audio=None, output=None):
     content = NS(
-        input_transcription=NS(text=transcript, finished=bool(complete) if transcript_finished is None else transcript_finished) if transcript is not None else None,
+        input_transcription=(NS(text=transcript) if finished_missing else
+            NS(text=transcript, finished=bool(complete) if transcript_finished is None else transcript_finished)) if transcript is not None else None,
         output_transcription=NS(text=output) if output is not None else None,
         turn_complete=complete,
         interrupted=interrupted,
@@ -56,6 +57,9 @@ class FakeSession:
         self.cycles = asyncio.Queue()
         self.tool_responses = []
         self.audio_inputs = []
+        self.activity_inputs = []
+        self.realtime_events = []
+        self.client_contents = []
         self.cancelled = False
 
     async def receive(self):
@@ -71,8 +75,20 @@ class FakeSession:
     async def send_tool_response(self, *, function_responses):
         self.tool_responses.extend(function_responses)
 
-    async def send_realtime_input(self, *, audio):
-        self.audio_inputs.append(audio)
+    async def send_realtime_input(self, *, audio=None, audio_stream_end=False, activity_start=None, activity_end=None):
+        if activity_start is not None:
+            self.activity_inputs.append("start")
+            self.realtime_events.append("start")
+        if activity_end is not None:
+            self.activity_inputs.append("end")
+            self.realtime_events.append("end")
+        if audio is not None:
+            self.realtime_events.append(audio.data)
+        if audio is not None or audio_stream_end:
+            self.audio_inputs.append(audio if audio is not None else {"audio_stream_end": audio_stream_end})
+
+    async def send_client_content(self, *, turns, turn_complete):
+        self.client_contents.append((turns, turn_complete))
 
 
 class FakeAdapter:
@@ -111,15 +127,22 @@ class FakeTools:
 def fake_genai_types(monkeypatch):
     monkeypatch.setattr(app, "types", NS(
         Blob=lambda **kwargs: NS(**kwargs),
+        ActivityStart=lambda **kwargs: NS(**kwargs),
+        ActivityEnd=lambda **kwargs: NS(**kwargs),
         FunctionResponse=lambda **kwargs: NS(**kwargs),
+        Content=lambda **kwargs: NS(**kwargs),
+        Part=lambda **kwargs: NS(**kwargs),
     ))
 
 
-async def run(ws, session, tools, adapter, *, max_session_seconds=2, end_session_timeout_seconds=5):
+async def run(ws, session, tools, adapter, *, max_session_seconds=2, end_session_timeout_seconds=5,
+              speech_timeout_seconds=45, first_audio_timeout_seconds=10, protocol_version=2, max_audio_bytes=100):
     return await app._run_hutch_live_session(
         ws=ws, session=session, tools=tools, adapter=adapter,
-        binding_id="binding-1", session_id="voice-1", max_audio_bytes=100,
+        binding_id="binding-1", session_id="voice-1", max_audio_bytes=max_audio_bytes,
         max_session_seconds=max_session_seconds, end_session_timeout_seconds=end_session_timeout_seconds,
+        speech_timeout_seconds=speech_timeout_seconds,
+        first_audio_timeout_seconds=first_audio_timeout_seconds, protocol_version=protocol_version,
     )
 
 
@@ -142,7 +165,7 @@ async def test_split_final_transcription_is_forwarded_and_receive_cycles_handle_
 
 
 @pytest.mark.asyncio
-async def test_proposal_ack_lifecycle_and_interruption_revoke_presentation_eligibility():
+async def test_streamed_proposal_never_authorizes_spoken_presentation():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
@@ -153,8 +176,8 @@ async def test_proposal_ack_lifecycle_and_interruption_revoke_presentation_eligi
     await ws.wait_for(lambda: any(item.get("type") == "playback_ack" for item in ws.outgoing if isinstance(item, dict)))
     await ws.incoming.put({"text": '{"type":"proposal_presented","response_id":"response-1","proposal_id":"proposal-1","proposal_hash":"hash-1"}'})
     await ws.wait_for(lambda: any(item.get("type") == "proposal_ack" for item in ws.outgoing if isinstance(item, dict)))
-    assert ws.outgoing[-1] == {"type": "proposal_ack", "response_id": "response-1", "accepted": True}
-    assert adapter.presented_proposal is not None
+    assert ws.outgoing[-1] == {"type": "proposal_ack", "response_id": "response-1", "accepted": False}
+    assert adapter.presented_proposal is None
     await session.cycles.put([event(interrupted=True)])
     await ws.wait_for(lambda: any(item.get("type") == "interrupted" for item in ws.outgoing if isinstance(item, dict)))
     assert ws.outgoing[-1] == {"type": "interrupted", "response_id": "response-1"}
@@ -188,7 +211,8 @@ async def test_resolve_end_session_waits_for_final_grounded_output_then_closes()
 @pytest.mark.asyncio
 async def test_end_session_has_a_bound_when_provider_never_finishes_reply(monkeypatch):
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools(end_session=True)
-    task = asyncio.create_task(run(ws, session, tools, adapter, end_session_timeout_seconds=0.03))
+    task = asyncio.create_task(run(ws, session, tools, adapter, end_session_timeout_seconds=0.03,
+                                   speech_timeout_seconds=0.03))
     await session.cycles.put([event(transcript="Goodbye", complete=True), event(tool_call=[call()])])
     assert await task == "ended"
     assert ws.closed == (1000, "resolve_requested")
@@ -263,6 +287,339 @@ async def test_incomplete_transcription_is_never_sent_to_resolve():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("same_event", [False, True])
+async def test_no_finished_transcript_then_model_tool_reuses_one_resolve_result(same_event):
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True,
+                                    tool_call=[call()] if same_event else None)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    if not same_event:
+        await session.cycles.put([event(tool_call=[call()])])
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert len(session.tool_responses) == 1
+    assert len(tools.transcripts) == 1
+    assert session.tool_responses[0].response["output"]["response_id"] == "response-1"
+    assert session.tool_responses[0].response["session_memory_snapshot"]["latest_resolve_result"]["reply_text"] == "Grounded support response"
+    assert len(session.client_contents) == 0  # tool result is the speech source
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
+    await asyncio.sleep(0.01)
+    assert not any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing)
+    await session.cycles.put([event(audio=b"live pcm", complete=True)])
+    await ws.wait_for(lambda: b"live pcm" in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_late_tool_and_original_turn_completion_in_same_event_do_not_request_second_turn():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    await session.cycles.put([event(tool_call=[call()], complete=True, audio=b"ungrounded")])
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert len(tools.transcripts) == 1
+    assert len(session.tool_responses) == 1
+    assert len(session.client_contents) == 0  # no competing snapshot after a tool call
+    assert b"ungrounded" not in ws.outgoing
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
+    await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
+    await ws.wait_for(lambda: b"grounded pcm" in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_after_interruption_boundary_reuses_resolve_result_and_speaks():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("response_id") == "response-1"
+                                  for item in ws.outgoing))
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
+    await session.cycles.put([event(audio=b"first grounded pcm", complete=True)])
+    await ws.wait_for(lambda: b"first grounded pcm" in ws.outgoing)
+    await session.cycles.put([event(transcript="My data stopped working", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("response_id") == "response-2"
+                                  for item in ws.outgoing))
+    for _ in range(50):
+        if len(session.client_contents) == 2:
+            break
+        await asyncio.sleep(0.01)
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
+    await asyncio.sleep(0.01)
+    assert len(session.client_contents) == 2
+    await session.cycles.put([event(tool_call=[call()])])
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert len(session.tool_responses) == 1
+    assert len(tools.transcripts) == 2
+    assert session.tool_responses[0].response["output"]["response_id"] == "response-2"
+    assert not any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing)
+    await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
+    await ws.wait_for(lambda: b"grounded pcm" in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("code") == "speech_unavailable"
+                   for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_repeated_tool_calls_for_one_turn_never_repeat_resolve():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(tool_call=[call("first")])])
+    for _ in range(50):
+        if len(session.tool_responses) == 1:
+            break
+        await asyncio.sleep(0.01)
+    await session.cycles.put([event(interrupted=True), event(complete=True)])
+    await session.cycles.put([event(tool_call=[call("second"), call("second")])])
+    for _ in range(50):
+        if len(session.tool_responses) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert [item.id for item in session.tool_responses] == ["first", "second"]
+    assert all(item.response["output"]["response_id"] == "response-1" for item in session.tool_responses)
+    assert len(tools.transcripts) == 1
+    await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
+    await ws.wait_for(lambda: b"grounded pcm" in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_call_is_never_answered():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                                  for item in ws.outgoing))
+    cancelled = event()
+    cancelled.tool_call_cancellation = type("Cancellation", (), {"ids": ["cancelled"]})()
+    await session.cycles.put([cancelled, event(tool_call=[call("cancelled")])])
+    await asyncio.sleep(0.02)
+    assert session.tool_responses == []
+    assert len(tools.transcripts) == 1
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_late_tool_receives_existing_resolve_error_instead_of_hanging():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools(failure="unavailable")
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True),
+                              event(tool_call=[call("failed")])])
+    for _ in range(50):
+        if len(session.tool_responses) == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert session.tool_responses[0].response["output"]["error"] == "unavailable"
+    assert len(tools.transcripts) == 1
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_provider_interruption_is_read_while_resolve_is_slow():
+    class SlowTools(FakeTools):
+        async def execute(self, name, *, transcript, language):
+            await asyncio.sleep(0.15)
+            return await super().execute(name, transcript=transcript, language=language)
+
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), SlowTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "transcript"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(interrupted=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "interrupted"
+                                  for item in ws.outgoing), timeout=0.1)
+    assert not any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                   for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_finalized_turns_arriving_during_slow_resolve_run_in_order():
+    class SlowTools(FakeTools):
+        async def execute(self, name, *, transcript, language):
+            await asyncio.sleep(0.08)
+            return await super().execute(name, transcript=transcript, language=language)
+
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), SlowTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="First balance question", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "transcript"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(transcript="Second data question", finished_missing=True)])
+    await ws.wait_for(lambda: len([item for item in ws.outgoing if isinstance(item, dict)
+                                   and item.get("type") == "resolve_result"]) == 2)
+    assert [item[0] for item in tools.transcripts] == ["First balance question", "Second data question"]
+    assert not any(isinstance(item, dict) and item.get("code") == "voice_turn_queue_full"
+                   for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_v3_caller_activity_stops_current_audio_and_rejects_old_frames():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=3))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(complete=True)])
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    assert session.client_contents
+    await session.cycles.put([event(audio=b"first pcm!")])
+    await ws.wait_for(lambda: b"first pcm!" in ws.outgoing)
+    await ws.incoming.put({"text": '{"type":"input_activity_start","segment_id":1}'})
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "interrupted"
+                                  for item in ws.outgoing))
+    await session.cycles.put([event(tool_call=[call("old-generation")])])
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert session.tool_responses[0].response["output"] == {"error": "ambiguous_generation"}
+    assert len(tools.transcripts) == 1
+    await session.cycles.put([event(audio=b"stale pcm!", complete=True)])
+    await asyncio.sleep(0.02)
+    assert b"stale pcm!" not in ws.outgoing
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_v3_forwards_only_browser_activity_boundaries_to_gemini():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=3))
+    await ws.incoming.put({"bytes": b"n" * 16})
+    await asyncio.sleep(0.02)
+    assert session.activity_inputs == []
+    assert session.audio_inputs == []
+
+    await ws.incoming.put({"text": '{"type":"input_activity_start","segment_id":1}'})
+    for _ in range(50):
+        if session.activity_inputs == ["start"]:
+            break
+        await asyncio.sleep(0.01)
+    assert session.activity_inputs == ["start"]
+    await ws.incoming.put({"bytes": b"s" * 16})
+    await ws.incoming.put({"text": '{"type":"input_activity_end","segment_id":1}'})
+    for _ in range(50):
+        if session.activity_inputs == ["start", "end"]:
+            break
+        await asyncio.sleep(0.01)
+    assert session.activity_inputs == ["start", "end"]
+    assert [item.data for item in session.audio_inputs] == [b"n" * 16, b"s" * 16]
+    assert session.realtime_events == ["start", b"n" * 16, b"s" * 16, "end"]
+
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_early_snapshot_interrupt_drops_old_audio_then_streams_grounded_reply():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    assert len(session.client_contents) == 1
+    await session.cycles.put([event(audio=b"old ungrounded"), event(interrupted=True),
+                              event(complete=True, audio=b"old tail")])
+    await asyncio.sleep(0.02)
+    assert b"old ungrounded" not in ws.outgoing
+    assert b"old tail" not in ws.outgoing
+    assert not any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing)
+    assert len(session.client_contents) == 1
+    await session.cycles.put([event(audio=b"grounded pcm", complete=True)])
+    await ws.wait_for(lambda: b"grounded pcm" in ws.outgoing)
+    assert len(tools.transcripts) == 1
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_live_final_transcript_without_finished_uses_session_memory_and_streams_speech():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    assert tools.transcripts == [("Check my balance", "en")]
+    assert [item["type"] for item in ws.outgoing if isinstance(item, dict)] == [
+        "transcript", "resolve_result",
+    ]
+    assert not any(isinstance(item, bytes) for item in ws.outgoing)
+    # If the original turn completes before the grace period, request only one snapshot.
+    await session.cycles.put([event(complete=True, audio=b"ungrounded", output="Unverified words")])
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    assert len(session.client_contents) == 1
+    assert session.client_contents[0][1] is True
+    assert 'hutch_resolve_session_memory_snapshot' in session.client_contents[0][0].parts[0].text
+    assert "Grounded support response" in session.client_contents[0][0].parts[0].text
+    assert b"ungrounded" not in ws.outgoing
+    await session.cycles.put([event(audio=b"streamed audio", output="Different wording")])
+    await ws.wait_for(lambda: b"streamed audio" in ws.outgoing)
+    assert any(isinstance(item, dict) and item.get("type") == "audio_start" for item in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing)
+    await session.cycles.put([event(complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
+    await session.cycles.put([event(tool_call=[call("late-model-tool")])])
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert len(tools.transcripts) == 1
+    assert session.tool_responses[0].response["output"] == {"error": "no_finalized_caller_turn"}
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_browser_end_of_speech_flushes_gemini_audio_once():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await ws.incoming.put({"bytes": b"\x01\x00" * 20})
+    await ws.incoming.put({"text": '{"type":"input_audio_end"}'})
+    await ws.incoming.put({"text": '{"type":"input_audio_end"}'})
+    await asyncio.sleep(0.02)
+    assert session.audio_inputs[1] == {"audio_stream_end": True}
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
 async def test_input_transcription_finished_is_authoritative_independent_of_turn_complete():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
@@ -305,6 +662,11 @@ async def test_binary_audio_is_forwarded_and_audio_budget_closes_cleanly():
 async def test_v2_rejects_malformed_controls_and_early_or_mismatched_proposal_ack():
     assert app._grant_from_protocol("zeptaz-hutch-v1,hutch-grant.token") is None
     assert app._grant_from_protocol("zeptaz-hutch-v2,hutch-grant.token") == ("zeptaz-hutch-v2", "token")
+    assert app._grant_from_protocol("zeptaz-hutch-v3,hutch-grant.token") == ("zeptaz-hutch-v3", "token")
+    assert app._parse_browser_control('{"type":"input_activity_start","segment_id":1}') == {
+        "type": "input_activity_start", "segment_id": 1,
+    }
+    assert app._parse_browser_control('{"type":"input_activity_start","segment_id":true}') is None
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
@@ -332,7 +694,11 @@ async def test_zero_audio_cannot_be_acknowledged_and_later_model_audio_is_droppe
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
     await session.cycles.put([event(complete=True, output="Grounded support response")])
-    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_fallback" for item in ws.outgoing))
+    await asyncio.sleep(0.02)
+    assert len(session.client_contents) == 1
+    assert len(tools.transcripts) == 1
+    await session.cycles.put([event(complete=True, output="Grounded support response")])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing))
     await ws.incoming.put({"text": '{"type":"playback_complete","response_id":"response-1"}'})
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "playback_ack" for item in ws.outgoing))
     assert ws.outgoing[-1]["accepted"] is False
@@ -344,14 +710,76 @@ async def test_zero_audio_cannot_be_acknowledged_and_later_model_audio_is_droppe
 
 
 @pytest.mark.asyncio
-async def test_sensitive_speech_mismatch_discards_audio_and_proposal_eligibility():
+async def test_zero_audio_completion_retries_saved_resolve_speech_once_then_speaks():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", complete=True), event(tool_call=[call()])])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    await session.cycles.put([event(complete=True)])
+    await asyncio.sleep(0.02)
+    assert len(session.client_contents) == 1
+    assert not any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing)
+    await session.cycles.put([event(audio=b"recovered pcm0"), event(complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
+    assert b"recovered pcm0" in ws.outgoing
+    assert len(tools.transcripts) == 1
+    assert len(session.client_contents) == 1
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_thirty_sequential_turns_reuse_one_session_without_duplicate_resolve_calls():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, max_session_seconds=10))
+    for index in range(30):
+        response_id = f"response-{index + 1}"
+        await session.cycles.put([event(transcript=f"Question {index + 1}", complete=True,
+                                        tool_call=[call(f"call-{index + 1}")])])
+        await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result"
+                                      and item.get("response_id") == response_id for item in ws.outgoing))
+        await session.cycles.put([event(audio=b"safe pcm00", complete=True)])
+        await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end"
+                                      and item.get("response_id") == response_id for item in ws.outgoing))
+        await ws.incoming.put({"text": f'{{"type":"playback_complete","response_id":"{response_id}"}}'})
+        await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "playback_ack"
+                                      and item.get("response_id") == response_id and item.get("accepted")
+                                      for item in ws.outgoing))
+    assert len(tools.transcripts) == 30
+    assert len(session.tool_responses) == 30
+    assert not any(isinstance(item, dict) and item.get("type") == "error" for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_first_pcm_watchdog_retries_once_then_reports_unavailable():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, speech_timeout_seconds=0.3,
+                                   first_audio_timeout_seconds=0.03))
+    await session.cycles.put([event(transcript="Check my balance", complete=True), event(tool_call=[call()])])
+    await asyncio.sleep(0.06)
+    assert len(session.client_contents) == 1
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("code") == "speech_unavailable"
+                                  for item in ws.outgoing), timeout=0.3)
+    assert len(session.client_contents) == 1
+    assert len(tools.transcripts) == 1
+    assert not any(isinstance(item, dict) and item.get("type") == "audio_start" for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_model_audio_streams_without_transcript_comparison_but_proposal_stays_tap_only():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
-    await session.cycles.put([event(complete=True, audio=b"bad audio", output="Different consequence")])
-    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_fallback" for item in ws.outgoing))
-    assert b"bad audio" not in ws.outgoing
+    await session.cycles.put([event(audio=b"live pcm", output="Different wording")])
+    await ws.wait_for(lambda: b"live pcm" in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing)
+    await session.cycles.put([event(complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
     await ws.incoming.put({"text": '{"type":"playback_complete","response_id":"response-1"}'})
     await ws.incoming.put({"text": '{"type":"proposal_presented","response_id":"response-1","proposal_id":"proposal-1","proposal_hash":"hash-1"}'})
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "proposal_ack" for item in ws.outgoing))
@@ -361,18 +789,21 @@ async def test_sensitive_speech_mismatch_discards_audio_and_proposal_eligibility
 
 
 @pytest.mark.asyncio
-async def test_ordinary_resolve_reply_mismatch_cannot_play_unverified_financial_audio():
+async def test_tool_reply_carries_resolve_session_memory_without_audio_buffering():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="What happened to my bill?", complete=True), event(tool_call=[call()])])
     await ws.wait_for(lambda: any(item.get("type") == "resolve_result" for item in ws.outgoing if isinstance(item, dict)))
-    # The invented claim differs from Resolve's canonical text and must never reach the caller.
-    await session.cycles.put([event(complete=True, audio=b"false refund audio", output="Your LKR 8,000 refund was approved.")])
-    await ws.wait_for(lambda: any(item.get("type") == "audio_fallback" for item in ws.outgoing if isinstance(item, dict)))
-    assert b"false refund audio" not in ws.outgoing
-    assert not any(isinstance(item, dict) and item.get("type") == "transcript" and item.get("speaker") == "assistant" for item in ws.outgoing)
-    fallback = next(item for item in ws.outgoing if isinstance(item, dict) and item.get("type") == "audio_fallback")
-    assert fallback["text"] == "Grounded support response"
+    for _ in range(50):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert session.tool_responses[0].response["session_memory_snapshot"]["latest_resolve_result"]["reply_text"] == "Grounded support response"
+    await session.cycles.put([event(audio=b"first pcm0")])
+    await ws.wait_for(lambda: b"first pcm0" in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing)
+    await session.cycles.put([event(complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 
@@ -394,7 +825,7 @@ async def test_resolve_tool_failure_emits_typed_error_and_never_forwards_model_c
         "message": "I couldn’t complete that request. Please continue by text or try again.",
     }]
     assert b"fabricated claim" not in ws.outgoing
-    assert not any(isinstance(item, dict) and item.get("type") in {"resolve_result", "audio_fallback"} for item in ws.outgoing)
+    assert not any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing)
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 
@@ -406,16 +837,16 @@ async def test_coalesced_completion_and_tool_call_cannot_end_before_new_reply():
     await session.cycles.put([event(transcript="Goodbye", complete=True, tool_call=[call()])])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
     assert ws.closed is None
-    await session.cycles.put([event(complete=True, audio=b"final", output="Grounded support response")])
-    await ws.wait_for(lambda: b"final" in ws.outgoing)
+    await session.cycles.put([event(complete=True, audio=b"final pcm0", output="Grounded support response")])
+    await ws.wait_for(lambda: b"final pcm0" in ws.outgoing)
     assert ws.closed is None
     await ws.incoming.put({"text": '{"type":"playback_complete","response_id":"response-1"}'})
     assert await task == "ended"
-    assert ws.outgoing.index(b"final") < next(i for i, item in enumerate(ws.outgoing) if isinstance(item, dict) and item.get("type") == "ended")
+    assert ws.outgoing.index(b"final pcm0") < next(i for i, item in enumerate(ws.outgoing) if isinstance(item, dict) and item.get("type") == "ended")
 
 
 @pytest.mark.asyncio
-async def test_interruption_discards_buffered_sensitive_audio():
+async def test_interruption_stops_later_model_audio():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
@@ -423,21 +854,100 @@ async def test_interruption_discards_buffered_sensitive_audio():
     await session.cycles.put([event(audio=b"unverified")])
     await session.cycles.put([event(interrupted=True), event(complete=True, output="Grounded support response")])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "interrupted" for item in ws.outgoing))
-    assert b"unverified" not in ws.outgoing
+    assert b"unverified" in ws.outgoing
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
 
 
 @pytest.mark.asyncio
-async def test_sensitive_audio_overflow_falls_back_to_approved_text():
+async def test_oversized_single_output_frame_is_rejected_without_playback():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
     await session.cycles.put([event(transcript="Stop renewal", complete=True), event(tool_call=[call()])])
     await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
-    oversized = b"\x00\x00" * (30 * 24000 + 1)
+    oversized = b"\x00\x00" * (60 * 24000 + 1)
     await session.cycles.put([event(complete=True, audio=oversized, output="Grounded support response")])
-    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_fallback" for item in ws.outgoing))
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing))
     assert oversized not in ws.outgoing
     assert not any(isinstance(item, dict) and item.get("type") == "audio_start" for item in ws.outgoing)
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_v3_preroll_is_bounded_and_mute_discards_it():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=3, max_audio_bytes=20000))
+    for value in (b"a", b"b", b"c", b"d"):
+        await ws.incoming.put({"bytes": value * 3200})
+    await ws.incoming.put({"text": '{"type":"input_activity_start","segment_id":1}'})
+    await ws.incoming.put({"text": '{"type":"input_activity_end","segment_id":1}'})
+    await ws.incoming.put({"bytes": b"discard" * 2})
+    await ws.incoming.put({"text": '{"type":"input_audio_end"}'})
+    await ws.incoming.put({"text": '{"type":"input_activity_start","segment_id":2}'})
+    await ws.incoming.put({"text": '{"type":"input_audio_end"}'})
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+    assert session.realtime_events == [
+        "start", b"b" * 3200 + b"c" * 3200 + b"d" * 3200, "end", "start", "end",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_late_tool_continuation_streams_without_a_second_speech_request():
+    """The grounded continuation after a late tool response is the reply; it is not discarded and re-requested."""
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    await session.cycles.put([event(audio=b"ungrounded preamble!"), event(tool_call=[call()])])
+    for _ in range(100):
+        if session.tool_responses:
+            break
+        await asyncio.sleep(0.01)
+    assert len(session.tool_responses) == 1
+    await session.cycles.put([event(audio=b"grounded continuation!")])
+
+    await ws.wait_for(lambda: b"grounded continuation!" in ws.outgoing)
+    assert b"ungrounded preamble!" not in ws.outgoing
+    await session.cycles.put([event(audio=b"more", complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "audio_end" for item in ws.outgoing))
+    assert session.client_contents == []  # no second generation of the same reply
+    assert len(tools.transcripts) == 1
+    assert [item["type"] for item in ws.outgoing if isinstance(item, dict) and item.get("type") in {"audio_start", "audio_end"}] == ["audio_start", "audio_end"]
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+class CountingSession(FakeSession):
+    def __init__(self):
+        super().__init__()
+        self.active_receives = 0
+        self.max_active_receives = 0
+
+    async def receive(self):
+        self.active_receives += 1
+        self.max_active_receives = max(self.max_active_receives, self.active_receives)
+        try:
+            async for item in super().receive():
+                yield item
+        finally:
+            self.active_receives -= 1
+
+
+@pytest.mark.asyncio
+async def test_speech_timeout_keeps_a_single_provider_read():
+    """A timed-out reply must not start a second concurrent receive on the Live socket (ConcurrencyError)."""
+    ws, session, adapter, tools = FakeWebSocket(), CountingSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, speech_timeout_seconds=0.05,
+                                   first_audio_timeout_seconds=0.02))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing))
+    await asyncio.sleep(0.05)
+    assert session.max_active_receives == 1
+    await session.cycles.put([event(complete=True)])
+    await session.cycles.put([event(transcript="Next question", finished_missing=True)])
+    await ws.wait_for(lambda: len(tools.transcripts) == 2)
+    assert session.max_active_receives == 1
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
