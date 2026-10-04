@@ -109,6 +109,13 @@ class FakeTools:
         self.end_session = end_session
         self.failure = failure
 
+    decision_replies: dict | None = None
+    decisions: list | None = None
+
+    async def decision_reply(self, proposal_id):
+        self.decisions = (self.decisions or []) + [proposal_id]
+        return (self.decision_replies or {}).get(proposal_id)
+
     async def execute(self, name, *, transcript, language):
         self.transcripts.append((transcript, language))
         if isinstance(self.failure, BaseException):
@@ -951,3 +958,87 @@ async def test_speech_timeout_keeps_a_single_provider_read():
     assert session.max_active_receives == 1
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
+
+
+DECISION_REPLY = {
+    "response_id": "decision-reply-1", "case_id": "case-1", "speech_text": "Your case is queued for review.",
+    "reply_text": "Your case is queued for review. I'll show the result once it's confirmed.",
+    "pending_question": None, "proposal": None, "operation_status": None, "end_session": False,
+}
+
+
+def _sent(ws, kind):
+    return [item for item in ws.outgoing if isinstance(item, dict) and item.get("type") == kind]
+
+
+@pytest.mark.asyncio
+async def test_v4_speaks_resolves_reply_after_the_caller_answers_on_screen():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    tools.decision_replies = {"proposal-9": DECISION_REPLY}
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=4))
+    await ws.incoming.put({"type": "websocket.receive", "text": '{"type":"decision_recorded","proposal_id":"proposal-9"}'})
+    await ws.wait_for(lambda: _sent(ws, "resolve_result"))
+    assert tools.decisions == ["proposal-9"] and tools.transcripts == []
+    assert _sent(ws, "resolve_result")[0]["reply_text"] == DECISION_REPLY["reply_text"]
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    prompt = session.client_contents[0][0].parts[0].text
+    assert "caller_answered_offer_on_screen" in prompt and "queued for review" in prompt
+    await session.cycles.put([event(audio=b"spoken confirmation!")])
+    await ws.wait_for(lambda: b"spoken confirmation!" in ws.outgoing)
+    await session.cycles.put([event(complete=True)])
+    await ws.wait_for(lambda: _sent(ws, "audio_end"))
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_screen_decision_with_no_recorded_reply_says_nothing():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=4))
+    await ws.incoming.put({"type": "websocket.receive", "text": '{"type":"decision_recorded","proposal_id":"unknown"}'})
+    for _ in range(50):
+        if tools.decisions:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    assert tools.decisions == ["unknown"]
+    assert not _sent(ws, "resolve_result") and not session.client_contents
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_screen_decision_is_not_spoken_over_a_caller_turn_in_progress():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    tools.decision_replies = {"proposal-9": DECISION_REPLY}
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=4))
+    await session.cycles.put([event(transcript="Check my balance", finished_missing=True)])
+    await ws.wait_for(lambda: _sent(ws, "resolve_result"))
+    await ws.incoming.put({"type": "websocket.receive", "text": '{"type":"decision_recorded","proposal_id":"proposal-9"}'})
+    for _ in range(50):
+        if tools.decisions:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    assert len(_sent(ws, "resolve_result")) == 1  # only the caller's own turn
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_v3_rejects_the_screen_decision_control():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=3))
+    await ws.incoming.put({"type": "websocket.receive", "text": '{"type":"decision_recorded","proposal_id":"proposal-9"}'})
+    await ws.wait_for(lambda: _sent(ws, "error"))
+    assert _sent(ws, "error")[0]["code"] == "invalid_browser_control" and tools.decisions is None
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+def test_v4_is_preferred_and_v3_still_accepted():
+    assert app._grant_from_protocol("zeptaz-hutch-v4, zeptaz-hutch-v3, hutch-grant.abc") == ("zeptaz-hutch-v4", "abc")
+    assert app._grant_from_protocol("zeptaz-hutch-v3, hutch-grant.abc") == ("zeptaz-hutch-v3", "abc")

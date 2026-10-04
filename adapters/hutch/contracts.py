@@ -67,6 +67,15 @@ class VoiceTurnResponse(StrictModel):
     end_session: bool = False
 
 
+class VoiceDecisionReplyRequest(StrictModel):
+    """Ask Resolve for its reply to a decision the caller tapped on screen (read-only)."""
+
+    binding_id: str
+    voice_session_id: str
+    event_id: str
+    proposal_id: str
+
+
 class VoiceEventRequest(StrictModel):
     binding_id: str
     voice_session_id: str
