@@ -148,10 +148,15 @@ async def hutch_lifecycle_event(request: Request,
         raise HTTPException(422, "invalid_lifecycle_event") from exc
 
 
+# Newest first. v4 = v3 plus `decision_recorded`: the caller answered an offer on screen, so Voice
+# speaks Resolve's reply to it. A browser that offers v4 still works with a server that only knows v3.
+PROTOCOL_VERSIONS = {"zeptaz-hutch-v4": 4, "zeptaz-hutch-v3": 3, "zeptaz-hutch-v2": 2}
+
+
 def _grant_from_protocol(header: str) -> tuple[str, str] | None:
     protocols = [part.strip() for part in header.split(",")]
     grant = next((item.removeprefix("hutch-grant.") for item in protocols if item.startswith("hutch-grant.")), None)
-    common = next((version for version in ("zeptaz-hutch-v3", "zeptaz-hutch-v2") if version in protocols), None)
+    common = next((version for version in PROTOCOL_VERSIONS if version in protocols), None)
     if common is None or not grant:
         return None
     return common, grant
@@ -189,6 +194,7 @@ def _parse_browser_control(raw: str) -> dict | None:
         "input_activity_end": {"type", "segment_id"},
         "playback_complete": {"type", "response_id"},
         "proposal_presented": {"type", "response_id", "proposal_id", "proposal_hash"},
+        "decision_recorded": {"type", "proposal_id"},
     }
     if control_type not in fields or set(value) != fields[control_type]:
         return None
@@ -237,6 +243,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
     audio_bytes = 0
     output_audio_limit = 60 * 24000 * 2
     caller_controls: asyncio.Queue[int] = asyncio.Queue(maxsize=4)
+    # Offers the caller answered on screen (v4); Voice then speaks Resolve's reply to that tap.
+    screen_decisions: asyncio.Queue[str] = asyncio.Queue(maxsize=2)
     owned_tasks: set[asyncio.Task] = set()
 
     def own_task(coro):
@@ -300,6 +308,12 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     elif control["segment_id"] == active_segment:
                         await session.send_realtime_input(activity_end=types.ActivityEnd())
                         active_segment = None
+                    continue
+                if control["type"] == "decision_recorded":
+                    if protocol_version < 4:
+                        await ws.send_json({"type": "error", "code": "invalid_browser_control"})
+                    elif not screen_decisions.full():
+                        screen_decisions.put_nowait(control["proposal_id"])
                     continue
                 if control["type"] == "input_audio_end":
                     preroll.clear()
@@ -365,6 +379,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
         forward_task_epoch = 0
         ambiguous_generation = False
         queued_final_turns: deque[tuple[str, str, int]] = deque()
+        decision_fetch: asyncio.Task | None = None
 
         async def request_snapshot_speech(current: _Reply):
             await session.send_client_content(
@@ -556,6 +571,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             iterator = aiter(session.receive())
             event_task: asyncio.Task | None = None
             control_task: asyncio.Task | None = None
+            decision_task: asyncio.Task | None = None
             while True:
                 try:
                     current_first_audio_deadline = (
@@ -570,9 +586,14 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         event_task = own_task(iterator.__anext__())
                     if protocol_version >= 3 and control_task is None:
                         control_task = own_task(caller_controls.get())
+                    if protocol_version >= 4 and decision_task is None and decision_fetch is None:
+                        decision_task = own_task(screen_decisions.get())
                     waiting = {event_task}
                     if control_task is not None:
                         waiting.add(control_task)
+                    for task in (decision_task, decision_fetch):
+                        if task is not None:
+                            waiting.add(task)
                     if forward_task is not None:
                         waiting.add(forward_task)
                     timeout = max(0.01, min(deadlines) - time.monotonic()) if deadlines else None
@@ -594,6 +615,42 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             pending_tool_calls.clear()
                             await ws.send_json({"type": "interrupted", "response_id": current_id})
                             logger.info("Voice caller activity session=%s segment=%s", session_id, segment_id)
+                        continue
+                    if decision_task is not None and decision_task in done:
+                        proposal_id = decision_task.result()
+                        decision_task = None
+                        decision_fetch = own_task(tools.decision_reply(proposal_id))
+                        continue
+                    if decision_fetch is not None and decision_fetch in done:
+                        response = decision_fetch.result()
+                        decision_fetch = None
+                        caller_busy = bool(forward_task is not None or pending_spoken_reply or latest_user_turn or
+                                           pending_tool_calls or queued_final_turns or (reply and not reply.complete))
+                        if response is None or caller_busy:
+                            # Nothing recorded, or the caller has already moved on: the reply stays on screen.
+                            logger.info("Voice screen decision not spoken session=%s found=%s busy=%s",
+                                        session_id, response is not None, caller_busy)
+                            continue
+                        revoke_reply(clear_presentation=False)
+                        reply = _Reply(
+                            response_id=str(response["response_id"]),
+                            proposal=response.get("proposal"),
+                            end_session=False,
+                            memory_snapshot=session_memory_snapshot(response, after_screen_decision=True),
+                            resolve_result_at=time.monotonic(),
+                        )
+                        speech_deadline = time.monotonic() + speech_timeout_seconds
+                        await ws.send_json({
+                            "type": "resolve_result", "response_id": reply.response_id,
+                            "case_id": response.get("case_id"), "reply_text": response.get("reply_text"),
+                            "pending_question": response.get("pending_question"), "proposal": response.get("proposal"),
+                            "operation_status": response.get("operation_status"), "end_session": False,
+                        })
+                        try:
+                            await request_snapshot_speech(reply)
+                        except Exception as exc:
+                            logger.warning("Voice decision speech request failed (%s)", type(exc).__name__)
+                            await finish_reply(reply)
                         continue
                     if forward_task is not None and forward_task in done:
                         await forward_task
@@ -622,9 +679,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     event = event_task.result()
                     event_task = None
                 except StopAsyncIteration:
-                    if control_task is not None:
-                        control_task.cancel()
-                        await asyncio.gather(control_task, return_exceptions=True)
+                    for task in (control_task, decision_task):
+                        if task is not None:
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
                     break
                 except asyncio.TimeoutError:
                     if tool_grace_deadline is not None and time.monotonic() >= tool_grace_deadline:
@@ -887,7 +945,7 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
         # or noise rejected by the browser cannot independently interrupt speech.
         # V2 keeps provider-managed detection for compatibility.
         realtime_input_config=_realtime_input_config(
-            protocol_version=3 if selected_protocol == "zeptaz-hutch-v3" else 2,
+            protocol_version=PROTOCOL_VERSIONS[selected_protocol],
             end_silence_ms=runtime_config.end_silence_ms,
             full_duplex=runtime_config.full_duplex),
         speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=os.getenv("GEMINI_TTS_VOICE", "Kore")))),
@@ -898,7 +956,7 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
         )
     try:
         async with _live_session(client, model, config) as session:
-            await ws.send_json({"type": "ready", "session_id": session_id, "provider": "gemini_live", "model": model, "live_profile": runtime_config.profile, "features": {"full_duplex":selected_protocol == "zeptaz-hutch-v3" and runtime_config.full_duplex,"context_compression":runtime_config.context_compression,"protocol_version":3 if selected_protocol == "zeptaz-hutch-v3" else 2}, "input_format": {"encoding": "pcm_s16le", "sample_rate": 16000}, "output_format": {"encoding": "pcm_s16le", "sample_rate": 24000}})
+            await ws.send_json({"type": "ready", "session_id": session_id, "provider": "gemini_live", "model": model, "live_profile": runtime_config.profile, "features": {"full_duplex":PROTOCOL_VERSIONS[selected_protocol] >= 3 and runtime_config.full_duplex,"context_compression":runtime_config.context_compression,"protocol_version":PROTOCOL_VERSIONS[selected_protocol]}, "input_format": {"encoding": "pcm_s16le", "sample_rate": 16000}, "output_format": {"encoding": "pcm_s16le", "sample_rate": 24000}})
             await ws.send_json({"type": "greeting", "text": "HUTCH Resolve demo. Tell me what you need help with."})
             await _run_hutch_live_session(
                 ws=ws, session=session, tools=tools, adapter=adapter,
@@ -906,7 +964,7 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
                 max_audio_bytes=int(os.getenv("HUTCH_VOICE_MAX_AUDIO_BYTES", "3840000")),
                 max_session_seconds=int(os.getenv("HUTCH_VOICE_MAX_SESSION_SECONDS", "120")),
                 end_session_timeout_seconds=float(os.getenv("HUTCH_VOICE_END_SESSION_TIMEOUT_SECONDS", "5")),
-                protocol_version=3 if selected_protocol == "zeptaz-hutch-v3" else 2,
+                protocol_version=PROTOCOL_VERSIONS[selected_protocol],
             )
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass

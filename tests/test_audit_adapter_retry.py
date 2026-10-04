@@ -51,3 +51,27 @@ async def test_retryable_processing_conflict_does_not_become_permanent_event_con
     assert pending.value.code == "resolve_turn_pending"
     assert pending.value.retryable is True
     assert bodies[0] == bodies[1]
+
+
+@pytest.mark.asyncio
+async def test_decision_reply_is_signed_and_a_missing_reply_is_none():
+    from adapters.hutch.contracts import VoiceDecisionReplyRequest
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, request.headers.get("x-voice-event-id")))
+        if b"proposal-known" in request.content:
+            return httpx.Response(200, json={"response_id": "r1", "reply_text": "Queued for review.",
+                                             "speech_text": "Queued for review."})
+        return httpx.Response(404, json={"error": {"code": "NOT_FOUND"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        client = HutchResolveClient(base_url="http://resolve.test/api/v1", secret="s" * 32, client=transport)
+        found = await client.decision_reply(VoiceDecisionReplyRequest(
+            binding_id="b", voice_session_id="v", event_id="e1", proposal_id="proposal-known"))
+        missing = await client.decision_reply(VoiceDecisionReplyRequest(
+            binding_id="b", voice_session_id="v", event_id="e2", proposal_id="proposal-other"))
+    assert found.reply_text == "Queued for review." and missing is None
+    assert seen == [("/api/v1/integrations/voice/decision-replies", "e1"),
+                    ("/api/v1/integrations/voice/decision-replies", "e2")]

@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 from .client import HutchResolveClient, ResolveClientError
-from .contracts import VoiceTurnRequest, VoiceTurnResponse
+from .contracts import VoiceDecisionReplyRequest, VoiceTurnRequest, VoiceTurnResponse
 
 VOICE_TOOLS = [{
     "name": "forward_final_turn_to_hutch_resolve",
@@ -28,11 +28,13 @@ SYSTEM_INSTRUCTION = (
 )
 
 
-def session_memory_snapshot(response: dict) -> dict:
+def session_memory_snapshot(response: dict, *, after_screen_decision: bool = False) -> dict:
     """Ephemeral per-turn Live context; no transcript or snapshot is persisted by Voice."""
     return {
         "kind": "hutch_resolve_session_memory_snapshot",
         "rules": SESSION_RULES,
+        # The caller just answered an offer with the on-screen buttons; this is Resolve's reply to that tap.
+        **({"event": "caller_answered_offer_on_screen"} if after_screen_decision else {}),
         "latest_resolve_result": {
             "reply_text": response.get("reply_text", ""),
             "case_id": response.get("case_id"),
@@ -91,11 +93,31 @@ class HutchAdapter:
         return response
 
 
+    async def decision_reply(self, *, binding_id: str, voice_session_id: str, proposal_id: str) -> VoiceTurnResponse | None:
+        """Resolve's reply to an offer the caller answered on screen; the next offer (if any) becomes pending."""
+        response = await self.client.decision_reply(VoiceDecisionReplyRequest(
+            binding_id=binding_id, voice_session_id=voice_session_id, event_id=str(uuid4()), proposal_id=proposal_id))
+        if response is not None:
+            self.pending_proposal = response.proposal.model_dump() if response.proposal else None
+            self.presented_proposal = None
+            self.latest_case_id = response.case_id or self.latest_case_id
+        return response
+
+
 class HutchVoiceTools:
     """Adapter-owned tool routing for finalized caller turns."""
 
     def __init__(self, adapter: HutchAdapter, binding_id: str, voice_session_id: str):
         self.adapter, self.binding_id, self.voice_session_id = adapter, binding_id, voice_session_id
+
+    async def decision_reply(self, proposal_id: str) -> dict | None:
+        """Resolve's reply to an on-screen decision, or None when there is none or Resolve can't be reached."""
+        try:
+            response = await self.adapter.decision_reply(
+                binding_id=self.binding_id, voice_session_id=self.voice_session_id, proposal_id=proposal_id)
+        except ResolveClientError:
+            return None
+        return response.model_dump() if response is not None else None
 
     async def execute(self, name: str, *, transcript: str, language: str) -> dict:
         if name != "forward_final_turn_to_hutch_resolve":

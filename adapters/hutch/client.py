@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import httpx
 
-from .contracts import VoiceTurnRequest, VoiceTurnResponse
+from .contracts import VoiceDecisionReplyRequest, VoiceTurnRequest, VoiceTurnResponse
 from .security import canonical_json, signed_headers
 
 
@@ -80,6 +80,26 @@ class HutchResolveClient:
             except (ValueError, TypeError) as exc:
                 raise ResolveClientError("resolve_invalid_response") from exc
         raise ResolveClientError("resolve_unavailable", retryable=True)
+
+    async def decision_reply(self, request: VoiceDecisionReplyRequest) -> VoiceTurnResponse | None:
+        """Resolve's reply to a decision tapped on screen; None when there is none (404). Read-only, one try."""
+        body = canonical_json(request.model_dump())
+        headers = signed_headers(self.secret, request.event_id, body)
+        try:
+            response = await self._client.post(f"{self.base_url}/integrations/voice/decision-replies",
+                                               content=body, headers=headers)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise ResolveClientError("resolve_unavailable", retryable=True) from exc
+        if response.status_code == 404:
+            return None
+        if response.status_code in (401, 403):
+            raise ResolveClientError("resolve_auth_failed")
+        if response.status_code >= 400:
+            raise ResolveClientError("resolve_rejected", retryable=response.status_code >= 500)
+        try:
+            return VoiceTurnResponse.model_validate(response.json())
+        except (ValueError, TypeError) as exc:
+            raise ResolveClientError("resolve_invalid_response") from exc
 
     async def send_event(self, payload: dict) -> None:
         body = canonical_json(payload)
