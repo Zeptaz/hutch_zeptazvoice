@@ -1,4 +1,5 @@
 from core.system.voice_runtime_config import VoiceRuntimeConfig
+import app
 
 
 def test_runtime_config_keeps_optimization_experiments_off_by_default(monkeypatch):
@@ -29,3 +30,15 @@ def test_invalid_experimental_values_fall_back_safely(monkeypatch):
     assert config.retrieval_mode == "lexical"
     assert config.full_duplex is True
     assert len(config.fingerprint) == 16
+
+
+def test_v3_activity_config_uses_browser_vad_and_v2_keeps_provider_vad():
+    v3 = app._realtime_input_config(protocol_version=3, end_silence_ms=700, full_duplex=True)
+    v2 = app._realtime_input_config(protocol_version=2, end_silence_ms=700, full_duplex=True)
+    no_barge_in = app._realtime_input_config(protocol_version=3, end_silence_ms=700, full_duplex=False)
+
+    assert v3.automatic_activity_detection.disabled is True
+    assert v3.automatic_activity_detection.silence_duration_ms is None
+    assert v3.activity_handling == app.types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS
+    assert v2.automatic_activity_detection.disabled is False
+    assert no_barge_in.activity_handling == app.types.ActivityHandling.NO_INTERRUPTION

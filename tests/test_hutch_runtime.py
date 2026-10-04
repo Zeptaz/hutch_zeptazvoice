@@ -57,6 +57,8 @@ class FakeSession:
         self.cycles = asyncio.Queue()
         self.tool_responses = []
         self.audio_inputs = []
+        self.activity_inputs = []
+        self.realtime_events = []
         self.client_contents = []
         self.cancelled = False
 
@@ -73,8 +75,17 @@ class FakeSession:
     async def send_tool_response(self, *, function_responses):
         self.tool_responses.extend(function_responses)
 
-    async def send_realtime_input(self, *, audio=None, audio_stream_end=False):
-        self.audio_inputs.append(audio if audio is not None else {"audio_stream_end": audio_stream_end})
+    async def send_realtime_input(self, *, audio=None, audio_stream_end=False, activity_start=None, activity_end=None):
+        if activity_start is not None:
+            self.activity_inputs.append("start")
+            self.realtime_events.append("start")
+        if activity_end is not None:
+            self.activity_inputs.append("end")
+            self.realtime_events.append("end")
+        if audio is not None:
+            self.realtime_events.append(audio.data)
+        if audio is not None or audio_stream_end:
+            self.audio_inputs.append(audio if audio is not None else {"audio_stream_end": audio_stream_end})
 
     async def send_client_content(self, *, turns, turn_complete):
         self.client_contents.append((turns, turn_complete))
@@ -116,6 +127,8 @@ class FakeTools:
 def fake_genai_types(monkeypatch):
     monkeypatch.setattr(app, "types", NS(
         Blob=lambda **kwargs: NS(**kwargs),
+        ActivityStart=lambda **kwargs: NS(**kwargs),
+        ActivityEnd=lambda **kwargs: NS(**kwargs),
         FunctionResponse=lambda **kwargs: NS(**kwargs),
         Content=lambda **kwargs: NS(**kwargs),
         Part=lambda **kwargs: NS(**kwargs),
@@ -123,10 +136,10 @@ def fake_genai_types(monkeypatch):
 
 
 async def run(ws, session, tools, adapter, *, max_session_seconds=2, end_session_timeout_seconds=5,
-              speech_timeout_seconds=45, first_audio_timeout_seconds=10, protocol_version=2):
+              speech_timeout_seconds=45, first_audio_timeout_seconds=10, protocol_version=2, max_audio_bytes=100):
     return await app._run_hutch_live_session(
         ws=ws, session=session, tools=tools, adapter=adapter,
-        binding_id="binding-1", session_id="voice-1", max_audio_bytes=100,
+        binding_id="binding-1", session_id="voice-1", max_audio_bytes=max_audio_bytes,
         max_session_seconds=max_session_seconds, end_session_timeout_seconds=end_session_timeout_seconds,
         speech_timeout_seconds=speech_timeout_seconds,
         first_audio_timeout_seconds=first_audio_timeout_seconds, protocol_version=protocol_version,
@@ -501,6 +514,35 @@ async def test_v3_caller_activity_stops_current_audio_and_rejects_old_frames():
 
 
 @pytest.mark.asyncio
+async def test_v3_forwards_only_browser_activity_boundaries_to_gemini():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=3))
+    await ws.incoming.put({"bytes": b"n" * 16})
+    await asyncio.sleep(0.02)
+    assert session.activity_inputs == []
+    assert session.audio_inputs == []
+
+    await ws.incoming.put({"text": '{"type":"input_activity_start","segment_id":1}'})
+    for _ in range(50):
+        if session.activity_inputs == ["start"]:
+            break
+        await asyncio.sleep(0.01)
+    assert session.activity_inputs == ["start"]
+    await ws.incoming.put({"bytes": b"s" * 16})
+    await ws.incoming.put({"text": '{"type":"input_activity_end","segment_id":1}'})
+    for _ in range(50):
+        if session.activity_inputs == ["start", "end"]:
+            break
+        await asyncio.sleep(0.01)
+    assert session.activity_inputs == ["start", "end"]
+    assert [item.data for item in session.audio_inputs] == [b"n" * 16, b"s" * 16]
+    assert session.realtime_events == ["start", b"n" * 16, b"s" * 16, "end"]
+
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
 async def test_early_snapshot_interrupt_drops_old_audio_then_streams_grounded_reply():
     ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
     task = asyncio.create_task(run(ws, session, tools, adapter))
@@ -830,3 +872,22 @@ async def test_oversized_single_output_frame_is_rejected_without_playback():
     assert not any(isinstance(item, dict) and item.get("type") == "audio_start" for item in ws.outgoing)
     await ws.incoming.put({"type": "websocket.disconnect"})
     assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_v3_preroll_is_bounded_and_mute_discards_it():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=3, max_audio_bytes=20000))
+    for value in (b"a", b"b", b"c", b"d"):
+        await ws.incoming.put({"bytes": value * 3200})
+    await ws.incoming.put({"text": '{"type":"input_activity_start","segment_id":1}'})
+    await ws.incoming.put({"text": '{"type":"input_activity_end","segment_id":1}'})
+    await ws.incoming.put({"bytes": b"discard" * 2})
+    await ws.incoming.put({"text": '{"type":"input_audio_end"}'})
+    await ws.incoming.put({"text": '{"type":"input_activity_start","segment_id":2}'})
+    await ws.incoming.put({"text": '{"type":"input_audio_end"}'})
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+    assert session.realtime_events == [
+        "start", b"b" * 3200 + b"c" * 3200 + b"d" * 3200, "end", "start", "end",
+    ]

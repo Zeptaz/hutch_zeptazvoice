@@ -201,6 +201,17 @@ def _parse_browser_control(raw: str) -> dict | None:
     return value
 
 
+def _realtime_input_config(*, protocol_version: int, end_silence_ms: int, full_duplex: bool):
+    """V3 uses the browser's validated activity boundaries as the sole VAD."""
+    return types.RealtimeInputConfig(
+        automatic_activity_detection=types.AutomaticActivityDetection(
+            disabled=True) if protocol_version >= 3 else types.AutomaticActivityDetection(
+                disabled=False, silence_duration_ms=end_silence_ms),
+        activity_handling=(types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS
+                           if full_duplex else types.ActivityHandling.NO_INTERRUPTION),
+    )
+
+
 async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: str,
                                   session_id: str, max_audio_bytes: int,
                                   max_session_seconds: int, end_session_timeout_seconds: float = 5.0,
@@ -245,6 +256,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
         nonlocal audio_bytes
         audio_since_end = False
         current_segment = 0
+        active_segment: int | None = None
+        # Retain at most 300 ms of PCM16 at 16 kHz before browser VAD accepts speech.
+        preroll = bytearray()
+        preroll_bytes = 9600
         while True:
             message = await ws.receive()
             if message.get("type") == "websocket.disconnect":
@@ -260,14 +275,33 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         await ws.send_json({"type": "error", "code": "invalid_browser_control"})
                     elif control["type"] == "input_activity_start":
                         if control["segment_id"] > current_segment:
+                            # V3 browser VAD is the single activity source. The Live
+                            # session has automatic VAD disabled for this protocol.
                             current_segment = control["segment_id"]
+                            if active_segment is not None:
+                                await session.send_realtime_input(activity_end=types.ActivityEnd())
+                            await session.send_realtime_input(activity_start=types.ActivityStart())
+                            active_segment = current_segment
                             if not caller_controls.full():
                                 caller_controls.put_nowait(current_segment)
+                            if preroll:
+                                await session.send_realtime_input(audio=types.Blob(
+                                    data=bytes(preroll), mime_type="audio/pcm;rate=16000"))
+                                preroll.clear()
+                    elif control["segment_id"] == active_segment:
+                        await session.send_realtime_input(activity_end=types.ActivityEnd())
+                        active_segment = None
                     continue
                 if control["type"] == "input_audio_end":
-                    if audio_since_end:
+                    preroll.clear()
+                    if audio_since_end or active_segment is not None:
                         logger.info("Voice input segment ended session=%s bytes=%s", session_id, audio_bytes)
-                        await session.send_realtime_input(audio_stream_end=True)
+                        if protocol_version >= 3:
+                            if active_segment is not None:
+                                await session.send_realtime_input(activity_end=types.ActivityEnd())
+                                active_segment = None
+                        else:
+                            await session.send_realtime_input(audio_stream_end=True)
                         audio_since_end = False
                     continue
                 current = reply
@@ -298,6 +332,11 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 except Exception:
                     pass
                 return "audio_limit"
+            if protocol_version >= 3 and active_segment is None:
+                preroll.extend(data)
+                if len(preroll) > preroll_bytes:
+                    del preroll[:-preroll_bytes]
+                continue
             await session.send_realtime_input(audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000"))
 
     async def receive_model():
@@ -808,10 +847,14 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
         response_modalities=["AUDIO"], temperature=0.2,
         system_instruction=SYSTEM_INSTRUCTION, tools=tool_declarations,
         input_audio_transcription=types.AudioTranscriptionConfig(),
-        realtime_input_config=types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(disabled=False, silence_duration_ms=runtime_config.end_silence_ms),
-            activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS if runtime_config.full_duplex else None,
-        ),
+        # V3 already has browser VAD with noise filtering and numbered activity
+        # boundaries. Disable Gemini's independent detector there so raw-mic echo
+        # or noise rejected by the browser cannot independently interrupt speech.
+        # V2 keeps provider-managed detection for compatibility.
+        realtime_input_config=_realtime_input_config(
+            protocol_version=3 if selected_protocol == "zeptaz-hutch-v3" else 2,
+            end_silence_ms=runtime_config.end_silence_ms,
+            full_duplex=runtime_config.full_duplex),
         speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=os.getenv("GEMINI_TTS_VOICE", "Kore")))),
     )
     if runtime_config.context_compression:
