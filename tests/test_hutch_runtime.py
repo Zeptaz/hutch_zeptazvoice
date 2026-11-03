@@ -22,6 +22,87 @@ def call(call_id="call-1"):
     return NS(name=app.VOICE_TOOLS[0]["name"], id=call_id)
 
 
+@pytest.mark.asyncio
+async def test_v4_decision_barrier_discards_old_audio_and_reads_saved_result():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+
+    class Readback:
+        def __init__(self):
+            self.ids = []
+
+        async def read_decision_result(self, *, binding_id, voice_session_id, client_turn_id):
+            self.ids.append((binding_id, voice_session_id, client_turn_id))
+            return NS(model_dump=lambda: {
+                "response_id": "decision-1", "reply_text": "The request is pending review.",
+                "speech_text": "The request is pending review.", "operation_status": "REVIEW_REQUIRED",
+                "proposal": None, "pending_question": None, "end_session": False,
+            })
+
+    adapter.client = Readback()
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=4))
+    await session.cycles.put([event(transcript="Please help", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    await session.cycles.put([event(complete=True)])
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    assert session.client_contents
+    await session.cycles.put([event(audio=b"old speech")])
+    await ws.wait_for(lambda: b"old speech" in ws.outgoing)
+    await ws.incoming.put({"text": '{"type":"decision_begin"}'})
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "decision_ready" for item in ws.outgoing))
+    decision_id = "d04f20b6-9b59-45bd-951e-2d74ec27ed10"
+    await ws.incoming.put({"text": '{"type":"decision_result","client_turn_id":"' + decision_id + '"}'})
+    for _ in range(50):
+        if adapter.client.ids:
+            break
+        await asyncio.sleep(0.01)
+    assert len(adapter.client.ids) == 1
+    await session.cycles.put([event(audio=b"stale old speech")])
+    await session.cycles.put([event(complete=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("response_id") == "decision-1" for item in ws.outgoing))
+    await session.cycles.put([event(audio=b"saved outcome!", complete=True)])
+    await ws.wait_for(lambda: b"saved outcome!" in ws.outgoing)
+    assert b"stale old speech" not in ws.outgoing
+    assert adapter.client.ids == [("binding-1", "voice-1", decision_id)]
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_v4_missing_old_model_boundary_shows_saved_decision_without_unsafe_speech():
+    ws, session, adapter, tools = FakeWebSocket(), FakeSession(), FakeAdapter(), FakeTools()
+
+    async def read_decision_result(**kwargs):
+        return NS(model_dump=lambda: {
+            "response_id": "saved-decision", "reply_text": "The request remains pending.",
+            "speech_text": "The request remains pending.", "operation_status": "PENDING",
+            "proposal": None, "pending_question": None,
+        })
+
+    adapter.client = NS(read_decision_result=read_decision_result)
+    task = asyncio.create_task(run(ws, session, tools, adapter, protocol_version=4,
+                                   decision_barrier_timeout_seconds=0.6))
+    await session.cycles.put([event(transcript="Help me", finished_missing=True)])
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "resolve_result" for item in ws.outgoing))
+    await session.cycles.put([event(complete=True)])
+    for _ in range(50):
+        if session.client_contents:
+            break
+        await asyncio.sleep(0.01)
+    await session.cycles.put([event(audio=b"old speech")])
+    await ws.wait_for(lambda: b"old speech" in ws.outgoing)
+    await ws.incoming.put({"text": '{"type":"decision_begin"}'})
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("type") == "decision_ready" for item in ws.outgoing))
+    await ws.incoming.put({"text": '{"type":"decision_result","client_turn_id":"d04f20b6-9b59-45bd-951e-2d74ec27ed10"}'})
+    await ws.wait_for(lambda: any(isinstance(item, dict) and item.get("response_id") == "saved-decision" for item in ws.outgoing), timeout=1)
+    assert any(isinstance(item, dict) and item.get("code") == "speech_unavailable" for item in ws.outgoing)
+    assert len(session.client_contents) == 1
+    await ws.incoming.put({"type": "websocket.disconnect"})
+    assert await task == "disconnected"
+
+
 class FakeWebSocket:
     def __init__(self):
         self.incoming = asyncio.Queue()
@@ -136,13 +217,15 @@ def fake_genai_types(monkeypatch):
 
 
 async def run(ws, session, tools, adapter, *, max_session_seconds=2, end_session_timeout_seconds=5,
-              speech_timeout_seconds=45, first_audio_timeout_seconds=10, protocol_version=2, max_audio_bytes=100):
+              speech_timeout_seconds=45, first_audio_timeout_seconds=10, protocol_version=2, max_audio_bytes=100,
+              decision_barrier_timeout_seconds=20):
     return await app._run_hutch_live_session(
         ws=ws, session=session, tools=tools, adapter=adapter,
         binding_id="binding-1", session_id="voice-1", max_audio_bytes=max_audio_bytes,
         max_session_seconds=max_session_seconds, end_session_timeout_seconds=end_session_timeout_seconds,
         speech_timeout_seconds=speech_timeout_seconds,
         first_audio_timeout_seconds=first_audio_timeout_seconds, protocol_version=protocol_version,
+        decision_barrier_timeout_seconds=decision_barrier_timeout_seconds,
     )
 
 

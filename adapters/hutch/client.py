@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import httpx
 
-from .contracts import VoiceTurnRequest, VoiceTurnResponse
+from .contracts import DecisionResultRequest, VoiceTurnRequest, VoiceTurnResponse
 from .security import canonical_json, signed_headers
 
 
@@ -91,3 +91,25 @@ class HutchResolveClient:
             raise ResolveClientError("resolve_unavailable", retryable=True) from exc
         if response.status_code >= 400:
             raise ResolveClientError("resolve_event_rejected", retryable=response.status_code >= 500)
+
+    async def read_decision_result(self, *, binding_id: str, voice_session_id: str,
+                                   client_turn_id: str) -> VoiceTurnResponse:
+        request = DecisionResultRequest(binding_id=binding_id, voice_session_id=voice_session_id,
+                                        client_turn_id=client_turn_id, event_id=str(uuid4()))
+        body = canonical_json(request.model_dump())
+        try:
+            response = await asyncio.wait_for(self._client.post(
+                f"{self.base_url}/integrations/voice/decision-results", content=body,
+                headers=signed_headers(self.secret, request.event_id, body)), timeout=12.0)
+        except (asyncio.TimeoutError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise ResolveClientError("resolve_unavailable", retryable=True) from exc
+        if response.status_code >= 500:
+            raise ResolveClientError("resolve_unavailable", retryable=True)
+        if response.status_code in (401, 403):
+            raise ResolveClientError("resolve_auth_failed")
+        if response.status_code >= 400:
+            raise ResolveClientError("decision_result_unavailable", retryable=response.status_code in (404, 409))
+        try:
+            return VoiceTurnResponse.model_validate(response.json())
+        except (ValueError, TypeError) as exc:
+            raise ResolveClientError("resolve_invalid_response") from exc

@@ -241,6 +241,26 @@ def detect_language(text: str, allowed: Iterable[str] = SUPPORTED_LANGUAGE_CODES
     return LanguageDecision(None, 0.0, "undetermined")
 
 
+def choose_call_language(text: str, active_language: str = "en") -> str:
+    """Keep the current call language until the caller provides clear contrary evidence."""
+    decision = detect_language(text)
+    if decision.language is None:
+        return active_language
+    if decision.source == "explicit_request":
+        return decision.language
+    if decision.source == "unicode_script":
+        return decision.language
+    if decision.source == "romanized_markers" and decision.confidence >= 0.70:
+        return decision.language
+    # Latin fallback is weak evidence: a short English name or acknowledgement
+    # should not switch an established Sinhala or Tamil call to English.
+    if decision.language == "en" and active_language != "en":
+        tokens = re.findall(r"[a-z]+", text.casefold())
+        if len(tokens) >= 5 and len(text.strip()) >= 24:
+            return "en"
+    return active_language
+
+
 def output_policy_violations(text: str, language: str | None) -> list[str]:
     """Return deterministic spoken-language policy violations worth reviewing."""
     if normalize_language(language) != "ta":

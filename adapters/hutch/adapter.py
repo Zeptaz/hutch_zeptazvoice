@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from .client import HutchResolveClient, ResolveClientError
 from .contracts import VoiceTurnRequest, VoiceTurnResponse
+from core.services.language_policy import get_language_profile
 
 VOICE_TOOLS = [{
     "name": "forward_final_turn_to_hutch_resolve",
@@ -28,15 +29,18 @@ SYSTEM_INSTRUCTION = (
 )
 
 
-def session_memory_snapshot(response: dict) -> dict:
+def session_memory_snapshot(response: dict, language: str = "en") -> dict:
     """Ephemeral per-turn Live context; no transcript or snapshot is persisted by Voice."""
     return {
         "kind": "hutch_resolve_session_memory_snapshot",
         "rules": SESSION_RULES,
+        "language": language,
+        "language_response_policy": get_language_profile(language).response_policy,
         "latest_resolve_result": {
             "reply_text": response.get("reply_text", ""),
             "case_id": response.get("case_id"),
             "operation_status": response.get("operation_status"),
+            "pending_question": response.get("pending_question"),
             "proposal": response.get("proposal"),
         },
     }

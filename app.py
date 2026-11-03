@@ -23,7 +23,7 @@ from adapters.hutch.client import HutchResolveClient, ResolveClientError
 from adapters.hutch.contracts import SessionRequest, VoiceEventRequest
 from adapters.hutch.security import body_digest, canonical_json, verify_signature
 from adapters.hutch.store import HutchVoiceStore
-from core.services.language_policy import detect_language
+from core.services.language_policy import choose_call_language
 from core.system.voice_runtime_config import VoiceRuntimeConfig
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -151,7 +151,7 @@ async def hutch_lifecycle_event(request: Request,
 def _grant_from_protocol(header: str) -> tuple[str, str] | None:
     protocols = [part.strip() for part in header.split(",")]
     grant = next((item.removeprefix("hutch-grant.") for item in protocols if item.startswith("hutch-grant.")), None)
-    common = next((version for version in ("zeptaz-hutch-v3", "zeptaz-hutch-v2") if version in protocols), None)
+    common = next((version for version in ("zeptaz-hutch-v4", "zeptaz-hutch-v3", "zeptaz-hutch-v2") if version in protocols), None)
     if common is None or not grant:
         return None
     return common, grant
@@ -164,6 +164,9 @@ class _Reply:
     end_session: bool
     memory_snapshot: dict
     resolve_result_at: float
+    language: str = "en"
+    turn_number: int = 0
+    transcript_at: float | None = None
     speech_requested_at: float | None = None
     speech_retry_count: int = 0
     audio_bytes: int = 0
@@ -189,6 +192,9 @@ def _parse_browser_control(raw: str) -> dict | None:
         "input_activity_end": {"type", "segment_id"},
         "playback_complete": {"type", "response_id"},
         "proposal_presented": {"type", "response_id", "proposal_id", "proposal_hash"},
+        "decision_begin": {"type"},
+        "decision_cancel": {"type"},
+        "decision_result": {"type", "client_turn_id"},
     }
     if control_type not in fields or set(value) != fields[control_type]:
         return None
@@ -198,6 +204,12 @@ def _parse_browser_control(raw: str) -> dict | None:
     if any(not isinstance(value[key], str) or not value[key] or len(value[key]) > 128
            for key in fields[control_type] - {"type", "segment_id"}):
         return None
+    if control_type == "decision_result":
+        try:
+            from uuid import UUID
+            UUID(value["client_turn_id"])
+        except ValueError:
+            return None
     return value
 
 
@@ -217,17 +229,23 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                                   max_session_seconds: int, end_session_timeout_seconds: float = 5.0,
                                   speech_timeout_seconds: float = 45.0,
                                   first_audio_timeout_seconds: float = 10.0,
+                                  decision_barrier_timeout_seconds: float = 20.0,
                                   protocol_version: int = 2):
     """Supervise both sides of the live call until disconnect, failure, or Resolve end."""
     input_fragments: list[str] = []
     latest_user_turn = ""
     pending_tool_calls: list = []
     language = "en"
+    finalized_turns = 0
+    latest_transcript_at: float | None = None
     reply: _Reply | None = None
     end_deadline: float | None = None
     audio_bytes = 0
     output_audio_limit = 60 * 24000 * 2
-    caller_controls: asyncio.Queue[int] = asyncio.Queue(maxsize=4)
+    caller_controls: asyncio.Queue = asyncio.Queue(maxsize=8)
+    forwarding_paused = False
+    decision_barrier_ready = False
+    decision_result_submitted = False
     owned_tasks: set[asyncio.Task] = set()
 
     def own_task(coro):
@@ -253,7 +271,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
         end_deadline = None
 
     async def receive_audio():
-        nonlocal audio_bytes
+        nonlocal audio_bytes, forwarding_paused, decision_barrier_ready, decision_result_submitted
         audio_since_end = False
         current_segment = 0
         active_segment: int | None = None
@@ -270,7 +288,40 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 if control is None:
                     await ws.send_json({"type": "error", "code": "invalid_browser_control"})
                     continue
+                if control["type"].startswith("decision_"):
+                    if protocol_version < 3:
+                        await ws.send_json({"type": "error", "code": "invalid_browser_control"})
+                        continue
+                    if control["type"] == "decision_begin":
+                        if forwarding_paused:
+                            await ws.send_json({"type": "error", "code": "decision_barrier_active"})
+                            continue
+                        forwarding_paused = True
+                        decision_barrier_ready = False
+                        decision_result_submitted = False
+                        preroll.clear()
+                        if active_segment is not None:
+                            await session.send_realtime_input(activity_end=types.ActivityEnd())
+                            active_segment = None
+                    elif control["type"] == "decision_cancel":
+                        if decision_result_submitted:
+                            await ws.send_json({"type": "error", "code": "decision_result_pending"})
+                            continue
+                        forwarding_paused = False
+                        decision_barrier_ready = False
+                    elif not decision_barrier_ready:
+                        await ws.send_json({"type": "error", "code": "decision_barrier_required"})
+                        continue
+                    elif decision_result_submitted:
+                        await ws.send_json({"type": "error", "code": "decision_result_pending"})
+                        continue
+                    elif control["type"] == "decision_result":
+                        decision_result_submitted = True
+                    await caller_controls.put(control)
+                    continue
                 if control["type"] in {"input_activity_start", "input_activity_end"}:
+                    if forwarding_paused:
+                        continue
                     if protocol_version < 3:
                         await ws.send_json({"type": "error", "code": "invalid_browser_control"})
                     elif control["type"] == "input_activity_start":
@@ -310,6 +361,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     accepted = bool(matching and current.complete and current.sent_audio and not current.playback_complete)
                     if accepted:
                         current.playback_complete = True
+                        if protocol_version >= 4:
+                            caller_controls.put_nowait({"type": "playback_drained"})
                     await ws.send_json({"type": "playback_ack", "response_id": control["response_id"], "accepted": accepted})
                     if accepted and current.end_session:
                         return await end_call()
@@ -319,6 +372,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                     await ws.send_json({"type": "proposal_ack", "response_id": control["response_id"], "accepted": False})
                 continue
             if data is None:
+                continue
+            if forwarding_paused:
                 continue
             if len(data) > 16384 or len(data) % 2:
                 await ws.send_json({"type": "error", "code": "invalid_audio_frame"})
@@ -340,7 +395,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             await session.send_realtime_input(audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000"))
 
     async def receive_model():
-        nonlocal language, latest_user_turn, reply, end_deadline
+        nonlocal language, latest_user_turn, reply, end_deadline, forwarding_paused, decision_barrier_ready
+        nonlocal finalized_turns, latest_transcript_at
         pending_spoken_reply: _Reply | None = None
         forwarded_without_tool: dict | None = None
         answered_tool_ids: set[str] = set()
@@ -356,6 +412,73 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
         forward_task_epoch = 0
         ambiguous_generation = False
         queued_final_turns: deque[tuple[str, str, int]] = deque()
+        decision_barrier_pending = False
+        decision_task: asyncio.Task | None = None
+        tool_processing_task: asyncio.Task | None = None
+        decision_barrier_deadline: float | None = None
+        decision_barrier_not_before: float | None = None
+        decision_wait_old_boundary = False
+        pending_decision_response: dict | None = None
+
+        async def start_decision_speech(response: dict):
+            nonlocal reply, speech_deadline, forwarding_paused, decision_barrier_pending, decision_barrier_ready
+            nonlocal decision_barrier_deadline, decision_barrier_not_before
+            revoke_reply(clear_presentation=False)
+            snapshot = session_memory_snapshot(response, language)
+            snapshot["decision_followup_policy"] = (
+                "Briefly state only the saved Resolve decision outcome. When it confirms the request is up for review, "
+                "say a natural equivalent in the selected language of: 'Okay, it is up for review. Would you like "
+                "to know about anything else?' If there is no proposal and no pending question, always invite the "
+                "caller to ask for anything else in the selected language. "
+                "Say submitted for review only if the saved outcome explicitly supports it; "
+                "never claim completion unless operation_status is SUCCEEDED."
+            )
+            reply = _Reply(
+                response_id=str(response["response_id"]), proposal=response.get("proposal"),
+                end_session=False, memory_snapshot=snapshot,
+                resolve_result_at=time.monotonic(), language=language)
+            adapter.pending_proposal = response.get("proposal")
+            decision_barrier_pending = False
+            decision_barrier_ready = False
+            decision_barrier_deadline = None
+            decision_barrier_not_before = None
+            forwarding_paused = False
+            speech_deadline = time.monotonic() + speech_timeout_seconds
+            await publish_result(response, reply)
+            await request_snapshot_speech(reply)
+
+        async def discard_reply_for_decision():
+            nonlocal reply, pending_spoken_reply, speech_deadline, tool_grace_deadline
+            current_id = reply.response_id if reply and not reply.complete else (
+                pending_spoken_reply.response_id if pending_spoken_reply else None)
+            if reply:
+                reply.interrupted = True
+                reply.complete = True
+                reply.playback_complete = True
+            pending_spoken_reply = None
+            speech_deadline = None
+            tool_grace_deadline = None
+            if current_id:
+                await ws.send_json({"type": "interrupted", "response_id": current_id})
+
+        async def maybe_ack_decision():
+            nonlocal decision_barrier_ready
+            if (decision_barrier_pending and not decision_barrier_ready and
+                    (decision_barrier_not_before is None or time.monotonic() >= decision_barrier_not_before) and
+                    forward_task is None and not latest_user_turn and
+                    tool_processing_task is None and not queued_final_turns and not pending_tool_calls and pending_spoken_reply is None and
+                    (reply is None or reply.complete and (not reply.sent_audio or reply.playback_complete))):
+                decision_barrier_ready = True
+                await ws.send_json({"type": "decision_ready"})
+
+        async def publish_result(response: dict, current: _Reply):
+            await ws.send_json({
+                "type": "resolve_result", "response_id": current.response_id,
+                "case_id": response.get("case_id"), "reply_text": response.get("reply_text"),
+                "pending_question": response.get("pending_question"), "proposal": response.get("proposal"),
+                "operation_status": response.get("operation_status"), "end_session": current.end_session,
+                "language": current.language,
+            })
 
         async def request_snapshot_speech(current: _Reply):
             await session.send_client_content(
@@ -389,6 +512,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             nonlocal latest_user_turn, pending_spoken_reply, forwarded_without_tool
             nonlocal snapshot_sent_early, original_turn_interrupted, speech_deadline
             nonlocal tool_grace_deadline, original_turn_complete, tool_response_sent
+            resolve_started_at = time.monotonic()
             try:
                 response = await tools.execute(VOICE_TOOLS[0]["name"], transcript=final_text, language=turn_language)
             except Exception as exc:
@@ -402,6 +526,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
             # Gemini may emit its tool call after the final input transcription.
             # Reuse this Resolve result for that late call instead of executing twice.
             forwarded_without_tool = response
+            logger.info("Voice Resolve result session=%s turn=%s resolve_ms=%d", session_id,
+                        finalized_turns, round((time.monotonic() - resolve_started_at) * 1000))
             revoke_reply(clear_presentation=False)
             pending_spoken_reply = _Reply(
                 response_id=str(response["response_id"]),
@@ -409,18 +535,16 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 end_session=bool(response.get("end_session", False)),
                 memory_snapshot=session_memory_snapshot(response),
                 resolve_result_at=time.monotonic(),
+                language=turn_language,
+                turn_number=finalized_turns, transcript_at=latest_transcript_at,
             )
             speech_deadline = time.monotonic() + speech_timeout_seconds
             snapshot_sent_early = False
             original_turn_interrupted = False
             original_turn_complete = False
             tool_response_sent = False
-            await ws.send_json({
-                "type": "resolve_result", "response_id": pending_spoken_reply.response_id,
-                "case_id": response.get("case_id"), "reply_text": response.get("reply_text"),
-                "pending_question": response.get("pending_question"), "proposal": response.get("proposal"),
-                "operation_status": response.get("operation_status"), "end_session": pending_spoken_reply.end_session,
-            })
+            pending_spoken_reply.memory_snapshot = session_memory_snapshot(response, turn_language)
+            await publish_result(response, pending_spoken_reply)
             # Give a blocking Gemini tool call a short chance to arrive. Sending
             # a second user turn while a tool call is pending can interrupt it.
             tool_grace_deadline = time.monotonic() + 0.3
@@ -458,27 +582,31 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                 else:
                     final_text = latest_user_turn
                     latest_user_turn = ""
+                    call_epoch = caller_epoch
+                    resolve_started_at = time.monotonic()
                     try:
                         response = await tools.execute(call.name, transcript=final_text, language=language)
                     except Exception as exc:
                         logger.warning("Resolve voice tool failed (%s)", type(exc).__name__)
                         response = {"error": "resolve_tool_failed"}
+                    if call_epoch != caller_epoch:
+                        response = {"error": "ambiguous_generation"}
+                    if not response.get("error"):
+                        logger.info("Voice Resolve result session=%s turn=%s resolve_ms=%d", session_id,
+                                    finalized_turns, round((time.monotonic() - resolve_started_at) * 1000))
                     if not response.get("error"):
                         revoke_reply(clear_presentation=False)
                         reply = _Reply(
                             response_id=str(response["response_id"]),
                             proposal=response.get("proposal"),
                             end_session=bool(response.get("end_session", False)),
-                            memory_snapshot=session_memory_snapshot(response),
+                            memory_snapshot=session_memory_snapshot(response, language),
                             resolve_result_at=time.monotonic(),
+                            language=language,
+                            turn_number=finalized_turns, transcript_at=latest_transcript_at,
                         )
                         speech_deadline = time.monotonic() + speech_timeout_seconds
-                        await ws.send_json({
-                            "type": "resolve_result", "response_id": reply.response_id,
-                            "case_id": response.get("case_id"), "reply_text": response.get("reply_text"),
-                            "pending_question": response.get("pending_question"), "proposal": response.get("proposal"),
-                            "operation_status": response.get("operation_status"), "end_session": reply.end_session,
-                        })
+                        await publish_result(response, reply)
                     else:
                         # Do not ask the model to explain an error in its own words: that can
                         # turn a failed lookup/action into a fabricated outcome for the caller.
@@ -488,7 +616,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         })
                 tool_output = {"output": response}
                 if not response.get("error"):
-                    tool_output["session_memory_snapshot"] = session_memory_snapshot(response)
+                    tool_output["session_memory_snapshot"] = session_memory_snapshot(response, reply.language if reply else language)
                 await session.send_tool_response(function_responses=[types.FunctionResponse(id=call.id, name=call.name, response=tool_output)])
                 answered_tool_ids.add(call.id)
                 if request_after_tool and reply and not response.get("error"):
@@ -526,7 +654,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         reply.speech_requested_at is not None else None
                     )
                     deadlines = [value for value in (end_deadline, speech_deadline, tool_grace_deadline,
-                                                     current_first_audio_deadline)
+                                                     current_first_audio_deadline, decision_barrier_deadline,
+                                                     decision_barrier_not_before)
                                  if value is not None]
                     if event_task is None:
                         event_task = own_task(iterator.__anext__())
@@ -537,11 +666,44 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         waiting.add(control_task)
                     if forward_task is not None:
                         waiting.add(forward_task)
+                    if decision_task is not None:
+                        waiting.add(decision_task)
+                    if tool_processing_task is not None:
+                        waiting.add(tool_processing_task)
                     timeout = max(0.01, min(deadlines) - time.monotonic()) if deadlines else None
                     done, _ = await asyncio.wait(waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
                     if control_task is not None and control_task in done:
-                        segment_id = control_task.result()
+                        control = control_task.result()
                         control_task = None
+                        if isinstance(control, dict):
+                            control_type = control["type"]
+                            if control_type == "decision_begin":
+                                decision_barrier_pending = True
+                                decision_barrier_deadline = time.monotonic() + decision_barrier_timeout_seconds
+                                decision_barrier_not_before = time.monotonic() + 0.3
+                                decision_wait_old_boundary = bool(
+                                    (reply and not reply.complete) or pending_spoken_reply)
+                                await discard_reply_for_decision()
+                                if latest_user_turn and forward_task is None:
+                                    final_text = latest_user_turn
+                                    latest_user_turn = ""
+                                    forward_task_epoch = caller_epoch
+                                    forward_task = own_task(forward_without_model_tool(final_text, language))
+                                await maybe_ack_decision()
+                            elif control_type == "decision_cancel":
+                                decision_barrier_pending = False
+                                decision_barrier_deadline = None
+                                decision_barrier_not_before = None
+                                decision_wait_old_boundary = False
+                                pending_decision_response = None
+                            elif control_type == "decision_result" and decision_barrier_ready:
+                                decision_task = own_task(adapter.client.read_decision_result(
+                                    binding_id=binding_id, voice_session_id=session_id,
+                                    client_turn_id=control["client_turn_id"]))
+                            elif control_type == "playback_drained":
+                                await maybe_ack_decision()
+                            continue
+                        segment_id = control
                         caller_epoch += 1
                         current_id = reply.response_id if reply and not reply.complete else (
                             pending_spoken_reply.response_id if pending_spoken_reply else None)
@@ -557,6 +719,37 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             await ws.send_json({"type": "interrupted", "response_id": current_id})
                             logger.info("Voice caller activity session=%s segment=%s", session_id, segment_id)
                         continue
+                    if decision_task is not None and decision_task in done:
+                        completed = decision_task
+                        decision_task = None
+                        try:
+                            decision_response = completed.result().model_dump()
+                        except (ResolveClientError, ValueError, AttributeError) as exc:
+                            logger.warning("Decision result readback failed session=%s error=%s", session_id, type(exc).__name__)
+                            decision_barrier_pending = False
+                            decision_barrier_ready = False
+                            decision_barrier_deadline = None
+                            decision_barrier_not_before = None
+                            forwarding_paused = False
+                            await ws.send_json({"type": "error", "code": "decision_result_unavailable",
+                                                "message": "The decision could not be read back. Please try again."})
+                            continue
+                        if decision_wait_old_boundary:
+                            pending_decision_response = decision_response
+                        else:
+                            await start_decision_speech(decision_response)
+                        continue
+                    if tool_processing_task is not None and tool_processing_task in done:
+                        completed = tool_processing_task
+                        tool_processing_task = None
+                        await completed
+                        if decision_barrier_pending:
+                            await discard_reply_for_decision()
+                        if pending_tool_calls:
+                            ready_calls, pending_tool_calls[:] = pending_tool_calls[:], []
+                            tool_processing_task = own_task(process_tool_calls(ready_calls))
+                        await maybe_ack_decision()
+                        continue
                     if forward_task is not None and forward_task in done:
                         await forward_task
                         forward_task = None
@@ -567,7 +760,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             speech_deadline = None
                         if pending_tool_calls:
                             ready_calls, pending_tool_calls[:] = pending_tool_calls[:], []
-                            await process_tool_calls(ready_calls)
+                            if tool_processing_task is None:
+                                tool_processing_task = own_task(process_tool_calls(ready_calls))
+                            else:
+                                pending_tool_calls.extend(ready_calls)
                         if queued_final_turns:
                             next_text, next_language, next_epoch = queued_final_turns.popleft()
                             latest_user_turn = ""
@@ -578,6 +774,9 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             speech_deadline = None
                             forward_task_epoch = next_epoch
                             forward_task = own_task(forward_without_model_tool(next_text, next_language))
+                        if decision_barrier_pending:
+                            await discard_reply_for_decision()
+                        await maybe_ack_decision()
                         continue
                     if event_task not in done:
                         raise asyncio.TimeoutError
@@ -589,6 +788,36 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         await asyncio.gather(control_task, return_exceptions=True)
                     break
                 except asyncio.TimeoutError:
+                    if (decision_barrier_deadline is not None and
+                            time.monotonic() >= decision_barrier_deadline):
+                        if decision_task is not None and not decision_task.done():
+                            decision_task.cancel()
+                        decision_task = None
+                        decision_barrier_pending = False
+                        decision_barrier_ready = False
+                        decision_barrier_deadline = None
+                        decision_barrier_not_before = None
+                        forwarding_paused = False
+                        if pending_decision_response is not None:
+                            saved = pending_decision_response
+                            saved_reply = _Reply(response_id=str(saved["response_id"]),
+                                                 proposal=saved.get("proposal"), end_session=False,
+                                                 memory_snapshot=session_memory_snapshot(saved, language),
+                                                 resolve_result_at=time.monotonic(), language=language)
+                            adapter.pending_proposal = saved.get("proposal")
+                            await publish_result(saved, saved_reply)
+                            await ws.send_json({"type": "error", "code": "speech_unavailable",
+                                                "message": "The decision is on screen, but speech is unavailable."})
+                            pending_decision_response = None
+                            continue
+                        pending_decision_response = None
+                        await ws.send_json({"type": "error", "code": "decision_barrier_timeout",
+                                            "message": "The call could not pause safely. Please try again."})
+                        continue
+                    if decision_barrier_not_before is not None and time.monotonic() >= decision_barrier_not_before:
+                        decision_barrier_not_before = None
+                        await maybe_ack_decision()
+                        continue
                     if tool_grace_deadline is not None and time.monotonic() >= tool_grace_deadline:
                         tool_grace_deadline = None
                         if pending_spoken_reply and not tool_response_sent:
@@ -607,8 +836,8 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         if await retry_snapshot_speech(reply):
                             continue
                         await finish_reply(reply)
-                        saw_event = True
-                        break
+                        await maybe_ack_decision()
+                        continue
                     if speech_deadline is not None and time.monotonic() >= speech_deadline:
                         waiting = pending_spoken_reply or (reply if reply and not reply.complete else None)
                         logger.info("Voice speech timeout session=%s pending=%s audio_bytes=%s",
@@ -623,11 +852,19 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                             reply = waiting
                             await finish_reply(waiting)
                         speech_deadline = None
-                        saw_event = True
-                        break
+                        await maybe_ack_decision()
+                        continue
                     return await end_call()
                 saw_event = True
                 content = getattr(event, "server_content", None)
+                if (decision_wait_old_boundary and content and
+                        (getattr(content, "turn_complete", False) or getattr(content, "interrupted", False))):
+                    decision_wait_old_boundary = False
+                    if pending_decision_response is not None:
+                        ready_decision = pending_decision_response
+                        pending_decision_response = None
+                        await start_decision_speech(ready_decision)
+                    continue
                 if content and getattr(content, "turn_complete", False):
                     logger.info("Voice model turn complete session=%s", session_id)
                 was_interrupted = bool(content and getattr(content, "interrupted", False))
@@ -666,9 +903,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         original_turn_interrupted = False
                         revoke_reply(clear_presentation=False)
                         if latest_user_turn:
-                            decision = detect_language(latest_user_turn)
-                            language = decision.language or language
-                            await ws.send_json({"type": "transcript", "speaker": "user", "text": latest_user_turn, "final": True})
+                            language = choose_call_language(latest_user_turn, language)
+                            finalized_turns += 1
+                            latest_transcript_at = time.monotonic()
+                            await ws.send_json({"type": "transcript", "speaker": "user", "text": latest_user_turn, "final": True, "language": language})
                             if final_without_flag:
                                 if forward_task is None:
                                     forward_task_epoch = caller_epoch
@@ -731,6 +969,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                                             round((now - current.resolve_result_at) * 1000),
                                             round((now - current.speech_requested_at) * 1000)
                                             if current.speech_requested_at is not None else "unknown")
+                                logger.info("Voice response latency session=%s turn=%s transcript_to_pcm_ms=%s",
+                                            session_id, current.turn_number,
+                                            round((now - current.transcript_at) * 1000)
+                                            if current.transcript_at is not None else "unknown")
                                 await ws.send_json({"type": "audio_start", "response_id": current.response_id})
                                 current.sent_audio = True
                             current.audio_bytes += len(frame)
@@ -739,6 +981,7 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                         if not current.sent_audio and await retry_snapshot_speech(current):
                             continue
                         await finish_reply(current)
+                        await maybe_ack_decision()
                 if calls:
                     logger.info("Voice model tool calls session=%s count=%s", session_id, len(calls))
                 if calls and ambiguous_generation and forwarded_without_tool is None:
@@ -757,7 +1000,10 @@ async def _run_hutch_live_session(*, ws, session, tools, adapter, binding_id: st
                                            (forwarded_without_tool and forwarded_without_tool.get("error")) or
                                            (reply and reply.complete)):
                     ready_calls, pending_tool_calls[:] = pending_tool_calls[:], []
-                    await process_tool_calls(ready_calls)
+                    if tool_processing_task is None:
+                        tool_processing_task = own_task(process_tool_calls(ready_calls))
+                    else:
+                        pending_tool_calls.extend(ready_calls)
                 if getattr(event, "go_away", None):
                     await ws.send_json({"type": "error", "code": "voice_session_ending", "message": "Continue by text if this call disconnects."})
             if not saw_event:
@@ -852,7 +1098,7 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
         # or noise rejected by the browser cannot independently interrupt speech.
         # V2 keeps provider-managed detection for compatibility.
         realtime_input_config=_realtime_input_config(
-            protocol_version=3 if selected_protocol == "zeptaz-hutch-v3" else 2,
+            protocol_version=4 if selected_protocol == "zeptaz-hutch-v4" else 3 if selected_protocol == "zeptaz-hutch-v3" else 2,
             end_silence_ms=runtime_config.end_silence_ms,
             full_duplex=runtime_config.full_duplex),
         speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=os.getenv("GEMINI_TTS_VOICE", "Kore")))),
@@ -863,15 +1109,17 @@ async def hutch_audio_socket(ws: WebSocket, session_id: str):
         )
     try:
         async with _live_session(client, model, config) as session:
-            await ws.send_json({"type": "ready", "session_id": session_id, "provider": "gemini_live", "model": model, "live_profile": runtime_config.profile, "features": {"full_duplex":selected_protocol == "zeptaz-hutch-v3" and runtime_config.full_duplex,"context_compression":runtime_config.context_compression,"protocol_version":3 if selected_protocol == "zeptaz-hutch-v3" else 2}, "input_format": {"encoding": "pcm_s16le", "sample_rate": 16000}, "output_format": {"encoding": "pcm_s16le", "sample_rate": 24000}})
+            protocol_version = 4 if selected_protocol == "zeptaz-hutch-v4" else 3 if selected_protocol == "zeptaz-hutch-v3" else 2
+            max_session_seconds = int(os.getenv("HUTCH_VOICE_MAX_SESSION_SECONDS", "300"))
+            await ws.send_json({"type": "ready", "session_id": session_id, "provider": "gemini_live", "model": model, "live_profile": runtime_config.profile, "language": "en", "max_session_seconds": max_session_seconds, "features": {"full_duplex":protocol_version >= 3 and runtime_config.full_duplex,"context_compression":runtime_config.context_compression,"decision_barrier": protocol_version >= 3,"protocol_version":protocol_version}, "input_format": {"encoding": "pcm_s16le", "sample_rate": 16000}, "output_format": {"encoding": "pcm_s16le", "sample_rate": 24000}})
             await ws.send_json({"type": "greeting", "text": "HUTCH Resolve demo. Tell me what you need help with."})
             await _run_hutch_live_session(
                 ws=ws, session=session, tools=tools, adapter=adapter,
                 binding_id=binding["binding_id"], session_id=session_id,
-                max_audio_bytes=int(os.getenv("HUTCH_VOICE_MAX_AUDIO_BYTES", "3840000")),
-                max_session_seconds=int(os.getenv("HUTCH_VOICE_MAX_SESSION_SECONDS", "120")),
+                max_audio_bytes=int(os.getenv("HUTCH_VOICE_MAX_AUDIO_BYTES", "9600000")),
+                max_session_seconds=max_session_seconds,
                 end_session_timeout_seconds=float(os.getenv("HUTCH_VOICE_END_SESSION_TIMEOUT_SECONDS", "5")),
-                protocol_version=3 if selected_protocol == "zeptaz-hutch-v3" else 2,
+                protocol_version=protocol_version,
             )
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass

@@ -29,6 +29,13 @@ class VoiceTurnRequest(StrictModel):
     presented_proposal_hash: str | None = None
 
 
+class DecisionResultRequest(StrictModel):
+    binding_id: str = Field(min_length=1, max_length=128)
+    voice_session_id: str = Field(min_length=1, max_length=128)
+    event_id: str = Field(min_length=1, max_length=128)
+    client_turn_id: str = Field(min_length=1, max_length=128)
+
+
 class PackageTerms(StrictModel):
     name: str = Field(strict=True, min_length=1, max_length=120)
     price_minor: int = Field(strict=True, ge=0, le=9_007_199_254_740_991)

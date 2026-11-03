@@ -1,4 +1,5 @@
 import httpx
+import json
 import pytest
 
 from adapters.hutch.adapter import HutchAdapter
@@ -51,3 +52,30 @@ async def test_retryable_processing_conflict_does_not_become_permanent_event_con
     assert pending.value.code == "resolve_turn_pending"
     assert pending.value.retryable is True
     assert bodies[0] == bodies[1]
+
+
+@pytest.mark.asyncio
+async def test_decision_readback_is_signed_and_validated():
+    seen = []
+
+    async def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={
+            "response_id": "saved-1", "reply_text": "Pending review",
+            "speech_text": "Pending review", "operation_status": "REVIEW_REQUIRED",
+            "end_session": False,
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        client = HutchResolveClient(base_url="http://resolve.test/api/v1", secret="s" * 32, client=transport)
+        result = await client.read_decision_result(
+            binding_id="binding-1", voice_session_id="voice-1", client_turn_id="turn-1")
+    assert result.response_id == "saved-1"
+    assert len(seen) == 1
+    assert seen[0].url.path.endswith("/integrations/voice/decision-results")
+    body = json.loads(seen[0].content)
+    assert body["binding_id"] == "binding-1"
+    assert body["voice_session_id"] == "voice-1"
+    assert body["client_turn_id"] == "turn-1"
+    assert seen[0].headers["x-voice-event-id"] == body["event_id"]
+    assert seen[0].headers["x-voice-signature"]
